@@ -45,11 +45,8 @@ func (p *Producer) Send(ctx context.Context, j job.Job) error {
 	if err := results.FirstErr(); err != nil {
 		return fmt.Errorf("sending message: %w", err)
 	}
-	slog.Debug("produced job",
-		slog.String("job_id", j.JobID()),
-		slog.String("topic", p.topic),
-	)
-	keepieotel.JobProduced(ctx, p.topic)
+	slog.Debug("produced job", slog.String("job_id", j.JobID()))
+	keepieotel.JobProduced(ctx)
 	return nil
 }
 
@@ -63,7 +60,6 @@ type Consumer struct {
 	client   *kgo.Client
 	producer *Producer
 	handler  Handler
-	topic    string
 }
 
 func NewConsumer(brokers []string, groupID, topic string, producer *Producer, handler Handler) (*Consumer, error) {
@@ -82,7 +78,6 @@ func NewConsumer(brokers []string, groupID, topic string, producer *Producer, ha
 		client:   client,
 		producer: producer,
 		handler:  handler,
-		topic:    topic,
 	}, nil
 }
 
@@ -97,7 +92,6 @@ func (c *Consumer) Start(ctx context.Context) error {
 				continue
 			}
 			slog.Error("fetch error",
-				slog.String("topic", e.Topic),
 				slog.Int("partition", int(e.Partition)),
 				slog.String("error", e.Err.Error()),
 			)
@@ -118,7 +112,6 @@ func (c *Consumer) Start(ctx context.Context) error {
 func (c *Consumer) processRecord(ctx context.Context, record *kgo.Record) {
 	received := time.Now()
 	slog.Debug("received record",
-		slog.String("topic", record.Topic),
 		slog.Int("partition", int(record.Partition)),
 		slog.Int64("offset", record.Offset),
 	)
@@ -126,15 +119,14 @@ func (c *Consumer) processRecord(ctx context.Context, record *kgo.Record) {
 	var kj kafkaJob
 	if err := json.Unmarshal(record.Value, &kj); err != nil {
 		slog.Error("unmarshaling message", slog.String("error", err.Error()))
-		keepieotel.UnmarshalError(ctx, c.topic)
+		keepieotel.UnmarshalError(ctx)
 		if commitErr := c.client.CommitRecords(ctx, record); commitErr != nil {
 			slog.Error("committing offset for invalid message",
 				slog.String("error", commitErr.Error()),
-				slog.String("topic", record.Topic),
 				slog.Int("partition", int(record.Partition)),
 				slog.Int64("offset", record.Offset),
 			)
-			keepieotel.OffsetCommitError(ctx, c.topic)
+			keepieotel.OffsetCommitError(ctx)
 		}
 		return
 	}
@@ -142,15 +134,14 @@ func (c *Consumer) processRecord(ctx context.Context, record *kgo.Record) {
 	j, err := kj.toJob()
 	if err != nil {
 		slog.Error("converting kafka job to domain job", slog.String("error", err.Error()))
-		keepieotel.UnmarshalError(ctx, c.topic)
+		keepieotel.UnmarshalError(ctx)
 		if commitErr := c.client.CommitRecords(ctx, record); commitErr != nil {
 			slog.Error("committing offset for unconvertible message",
 				slog.String("error", commitErr.Error()),
-				slog.String("topic", record.Topic),
 				slog.Int("partition", int(record.Partition)),
 				slog.Int64("offset", record.Offset),
 			)
-			keepieotel.OffsetCommitError(ctx, c.topic)
+			keepieotel.OffsetCommitError(ctx)
 		}
 		return
 	}
@@ -158,20 +149,19 @@ func (c *Consumer) processRecord(ctx context.Context, record *kgo.Record) {
 	if err := c.client.CommitRecords(ctx, record); err != nil {
 		slog.Error("committing offset",
 			slog.String("error", err.Error()),
-			slog.String("topic", record.Topic),
 			slog.Any("job", j),
 			slog.Int("partition", int(record.Partition)),
 			slog.Int64("offset", record.Offset),
 		)
-		keepieotel.OffsetCommitError(ctx, c.topic)
+		keepieotel.OffsetCommitError(ctx)
 		return
 	}
 
-	keepieotel.JobConsumed(ctx, c.topic)
+	keepieotel.JobConsumed(ctx)
 	if !j.RescheduledAt().IsZero() {
-		keepieotel.RecordTimeInQueue(ctx, c.topic, received.Sub(j.RescheduledAt()))
+		keepieotel.RecordTimeInQueue(ctx, received.Sub(j.RescheduledAt()))
 	} else {
-		keepieotel.RecordTimeInQueue(ctx, c.topic, received.Sub(j.CreatedAt()))
+		keepieotel.RecordTimeInQueue(ctx, received.Sub(j.CreatedAt()))
 	}
 
 	slog.Debug("processing job",
@@ -183,26 +173,30 @@ func (c *Consumer) processRecord(ctx context.Context, record *kgo.Record) {
 
 	start := time.Now()
 	if err := c.handler(ctx, j); err != nil {
-		keepieotel.RecordProcessingDuration(ctx, c.topic, time.Since(start))
+		keepieotel.RecordProcessingDuration(ctx, time.Since(start))
+
 		if job.IsRetryable(err) {
 			rescheduled := j.Reschedule(time.Now())
+			keepieotel.JobRescheduled(ctx)
+
 			slog.Info("rescheduling retryable job",
 				slog.Any("job", rescheduled),
 				slog.String("error", err.Error()),
 			)
-			keepieotel.JobRescheduled(ctx, c.topic)
+
 			if sendErr := c.producer.Send(ctx, rescheduled); sendErr != nil {
 				slog.Error("rescheduling job", slog.String("job_id", j.JobID()), slog.String("error", sendErr.Error()))
 			}
+
 			return
 		}
-		keepieotel.JobFailed(ctx, c.topic)
+		keepieotel.JobFailed(ctx)
 		slog.Error("handling job", slog.String("job_id", j.JobID()), slog.String("error", err.Error()))
 		return
 	}
 
-	keepieotel.RecordProcessingDuration(ctx, c.topic, time.Since(start))
-	keepieotel.JobProcessed(ctx, c.topic)
+	keepieotel.RecordProcessingDuration(ctx, time.Since(start))
+	keepieotel.JobProcessed(ctx)
 
 	slog.Debug("job processed successfully",
 		slog.String("job_id", j.JobID()),

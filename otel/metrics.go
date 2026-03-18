@@ -5,18 +5,17 @@ import (
 	"sync"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
 
 var (
 	instrumentsOnce sync.Once
 
-	jobsProduced    metric.Int64Counter
-	jobsConsumed    metric.Int64Counter
-	jobsProcessed   metric.Int64Counter
-	jobsFailed      metric.Int64Counter
-	jobsRescheduled metric.Int64Counter
+	jobsProduced       metric.Int64Counter
+	jobsConsumed       metric.Int64Counter
+	jobsProcessed      metric.Int64Counter
+	jobsFailed         metric.Int64Counter
+	jobsRescheduled    metric.Int64Counter
 	unmarshalErrors    metric.Int64Counter
 	offsetCommitErrors metric.Int64Counter
 
@@ -61,51 +60,47 @@ func initInstruments() {
 	})
 }
 
-func topicAttr(topic string) metric.MeasurementOption {
-	return metric.WithAttributes(attribute.String("topic", topic))
+func JobProduced(ctx context.Context) {
+	initInstruments()
+	jobsProduced.Add(ctx, 1)
 }
 
-func JobProduced(ctx context.Context, topic string) {
+func JobConsumed(ctx context.Context) {
 	initInstruments()
-	jobsProduced.Add(ctx, 1, topicAttr(topic))
+	jobsConsumed.Add(ctx, 1)
 }
 
-func JobConsumed(ctx context.Context, topic string) {
+func JobProcessed(ctx context.Context) {
 	initInstruments()
-	jobsConsumed.Add(ctx, 1, topicAttr(topic))
+	jobsProcessed.Add(ctx, 1)
 }
 
-func JobProcessed(ctx context.Context, topic string) {
+func JobFailed(ctx context.Context) {
 	initInstruments()
-	jobsProcessed.Add(ctx, 1, topicAttr(topic))
+	jobsFailed.Add(ctx, 1)
 }
 
-func JobFailed(ctx context.Context, topic string) {
+func JobRescheduled(ctx context.Context) {
 	initInstruments()
-	jobsFailed.Add(ctx, 1, topicAttr(topic))
+	jobsRescheduled.Add(ctx, 1)
 }
 
-func JobRescheduled(ctx context.Context, topic string) {
+func UnmarshalError(ctx context.Context) {
 	initInstruments()
-	jobsRescheduled.Add(ctx, 1, topicAttr(topic))
+	unmarshalErrors.Add(ctx, 1)
 }
 
-func UnmarshalError(ctx context.Context, topic string) {
+func OffsetCommitError(ctx context.Context) {
 	initInstruments()
-	unmarshalErrors.Add(ctx, 1, topicAttr(topic))
+	offsetCommitErrors.Add(ctx, 1)
 }
 
-func OffsetCommitError(ctx context.Context, topic string) {
+func RecordProcessingDuration(ctx context.Context, d time.Duration) {
 	initInstruments()
-	offsetCommitErrors.Add(ctx, 1, topicAttr(topic))
+	processingDuration.Record(ctx, d.Seconds())
 }
 
-func RecordProcessingDuration(ctx context.Context, topic string, d time.Duration) {
+func RecordTimeInQueue(ctx context.Context, d time.Duration) {
 	initInstruments()
-	processingDuration.Record(ctx, d.Seconds(), topicAttr(topic))
-}
-
-func RecordTimeInQueue(ctx context.Context, topic string, d time.Duration) {
-	initInstruments()
-	timeInQueue.Record(ctx, d.Seconds(), topicAttr(topic))
+	timeInQueue.Record(ctx, d.Seconds())
 }
