@@ -7,7 +7,7 @@ Uses [franz-go](https://github.com/twmb/franz-go) (`kgo`) for both producing and
 | Setting | Value | Why |
 |---|---|---|
 | Library | `twmb/franz-go` | Synchronous `CommitRecords` returns error, unlike sarama's fire-and-forget |
-| Partitions | 6 | Target: 2 instances x 2 workers = 4, with headroom for scaling |
+| Partitions | 6 | 2 instances × 3 partitions each = 6 concurrent workers, with room to scale to 6 instances |
 | Offset commit | Manual, commit-first | Commit before processing to prevent duplicate JWTs |
 | Partitioning | Round-robin (no key) | Jobs are independent, we want even distribution |
 | Auto-offset-reset | `earliest` | On first start or expired offsets, process from beginning rather than skip |
