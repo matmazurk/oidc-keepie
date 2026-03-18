@@ -9,6 +9,7 @@ import (
 
 	"github.com/IBM/sarama"
 	"github.com/matmazurk/oidc-keepie/job"
+	keepieotel "github.com/matmazurk/oidc-keepie/otel"
 )
 
 type Producer struct {
@@ -42,6 +43,7 @@ func (p *Producer) Send(ctx context.Context, topic string, j job.Job) error {
 	if err != nil {
 		return fmt.Errorf("sending message: %w", err)
 	}
+	keepieotel.JobProduced(ctx, topic)
 	return nil
 }
 
@@ -112,22 +114,34 @@ func (h *groupHandler) Cleanup(_ sarama.ConsumerGroupSession) error {
 
 func (h *groupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	for msg := range claim.Messages() {
+		ctx := session.Context()
 		session.MarkMessage(msg, "")
 		session.Commit()
 
 		var kj kafkaJob
 		if err := json.Unmarshal(msg.Value, &kj); err != nil {
 			slog.Error("unmarshaling message", slog.String("error", err.Error()))
+			keepieotel.UnmarshalError(ctx, h.topic)
 			continue
 		}
 
 		j, err := kj.toJob()
 		if err != nil {
 			slog.Error("converting kafka job to domain job", slog.String("error", err.Error()))
+			keepieotel.UnmarshalError(ctx, h.topic)
 			continue
 		}
 
-		if err := h.handler(session.Context(), j); err != nil {
+		keepieotel.JobConsumed(ctx, h.topic)
+		if !j.RescheduledAt().IsZero() {
+			keepieotel.RecordTimeInQueue(ctx, h.topic, time.Since(j.RescheduledAt()))
+		} else {
+			keepieotel.RecordTimeInQueue(ctx, h.topic, time.Since(j.CreatedAt()))
+		}
+
+		start := time.Now()
+		if err := h.handler(ctx, j); err != nil {
+			keepieotel.RecordProcessingDuration(ctx, h.topic, time.Since(start))
 			if job.IsRetryable(err) {
 				rescheduled := j.Reschedule(time.Now())
 				slog.Info("rescheduling retryable job",
@@ -135,13 +149,20 @@ func (h *groupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim s
 					slog.Int("retry_count", rescheduled.RetryCount()),
 					slog.String("error", err.Error()),
 				)
-				if sendErr := h.producer.Send(session.Context(), h.topic, rescheduled); sendErr != nil {
+				keepieotel.JobRescheduled(ctx, h.topic)
+				if sendErr := h.producer.Send(ctx, h.topic, rescheduled); sendErr != nil {
 					slog.Error("rescheduling job", slog.String("job_id", j.JobID()), slog.String("error", sendErr.Error()))
 				}
 				continue
 			}
+			keepieotel.JobFailed(ctx, h.topic)
 			slog.Error("handling job", slog.String("job_id", j.JobID()), slog.String("error", err.Error()))
+			continue
 		}
+
+		keepieotel.RecordProcessingDuration(ctx, h.topic, time.Since(start))
+		keepieotel.JobProcessed(ctx, h.topic)
 	}
+
 	return nil
 }
