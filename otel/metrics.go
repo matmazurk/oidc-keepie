@@ -17,7 +17,8 @@ var (
 	jobsProcessed   metric.Int64Counter
 	jobsFailed      metric.Int64Counter
 	jobsRescheduled metric.Int64Counter
-	unmarshalErrors metric.Int64Counter
+	unmarshalErrors    metric.Int64Counter
+	offsetCommitErrors metric.Int64Counter
 
 	processingDuration metric.Float64Histogram
 	timeInQueue        metric.Float64Histogram
@@ -44,6 +45,9 @@ func initInstruments() {
 		)
 		unmarshalErrors, _ = m.Int64Counter("keepie.jobs.unmarshal_errors",
 			metric.WithDescription("Number of messages that failed to unmarshal"),
+		)
+		offsetCommitErrors, _ = m.Int64Counter("keepie.consumer.offset_commit_errors",
+			metric.WithDescription("Number of offset commits that failed"),
 		)
 
 		processingDuration, _ = m.Float64Histogram("keepie.jobs.processing_duration_seconds",
@@ -89,6 +93,11 @@ func JobRescheduled(ctx context.Context, topic string) {
 func UnmarshalError(ctx context.Context, topic string) {
 	initInstruments()
 	unmarshalErrors.Add(ctx, 1, topicAttr(topic))
+}
+
+func OffsetCommitError(ctx context.Context, topic string) {
+	initInstruments()
+	offsetCommitErrors.Add(ctx, 1, topicAttr(topic))
 }
 
 func RecordProcessingDuration(ctx context.Context, topic string, d time.Duration) {
