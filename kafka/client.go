@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/IBM/sarama"
 	"github.com/matmazurk/oidc-keepie/job"
@@ -110,18 +110,18 @@ func (h *groupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim s
 
 		var kj kafkaJob
 		if err := json.Unmarshal(msg.Value, &kj); err != nil {
-			log.Printf("unmarshaling message: %v", err)
+			slog.Error("unmarshaling message", "error", err)
 			continue
 		}
 
 		j, err := kj.toJob()
 		if err != nil {
-			log.Printf("converting kafka job to domain job: %v", err)
+			slog.Error("converting kafka job to domain job", "error", err)
 			continue
 		}
 
 		if err := h.handler(session.Context(), j); err != nil {
-			log.Printf("handling job %s: %v", j.ID(), err)
+			slog.Error("handling job", "job_id", j.ID(), "error", err)
 		}
 	}
 	return nil
