@@ -1,9 +1,12 @@
 # Kafka Client
 
+Uses [franz-go](https://github.com/twmb/franz-go) (`kgo`) for both producing and consuming. Chosen over sarama for synchronous offset commit with error handling.
+
 ## Configuration
 
 | Setting | Value | Why |
 |---|---|---|
+| Library | `twmb/franz-go` | Synchronous `CommitRecords` returns error, unlike sarama's fire-and-forget |
 | Partitions | 6 | Target: 2 instances x 2 workers = 4, with headroom for scaling |
 | Offset commit | Manual, commit-first | Commit before processing to prevent duplicate JWTs |
 | Partitioning | Round-robin (no key) | Jobs are independent, we want even distribution |
@@ -15,7 +18,7 @@
 
 ### Producer
 
-The producer sends job messages to the Kafka topic. Messages are JSON-encoded and distributed across partitions using round-robin (no message key).
+The producer sends job messages to the Kafka topic. The topic is configured at creation time. Messages are JSON-encoded and distributed across partitions using round-robin (no message key).
 
 ```mermaid
 sequenceDiagram
@@ -23,17 +26,17 @@ sequenceDiagram
     participant Producer
     participant Kafka
 
-    App->>Producer: Send(ctx, topic, job)
+    App->>Producer: Send(ctx, job)
     Producer->>Producer: Convert job.Job → kafkaJob (add event ID + JSON tags)
     Producer->>Producer: Marshal to JSON
-    Producer->>Kafka: Send message (round-robin partition)
+    Producer->>Kafka: ProduceSync (round-robin partition)
     Kafka-->>Producer: Acknowledgment
     Producer-->>App: nil (success)
 ```
 
 ### Consumer
 
-The consumer joins a consumer group. Kafka assigns partitions to it. For each assigned partition, a separate goroutine runs `ConsumeClaim`, processing messages sequentially within that partition.
+The consumer joins a consumer group. Kafka assigns partitions to it. `PollFetches` returns batches of records from all assigned partitions. Records are fanned out — one goroutine per partition processes records sequentially within that partition, while partitions are processed in parallel.
 
 ```mermaid
 sequenceDiagram
@@ -41,45 +44,62 @@ sequenceDiagram
     participant Consumer
     participant Handler
 
-    loop For each message in partition
-        Kafka->>Consumer: Deliver message
-        Consumer->>Kafka: Commit offset (before processing!)
-        Consumer->>Consumer: Unmarshal JSON → kafkaJob → job.Job
-        Consumer->>Handler: handler(ctx, job)
-        alt Handler returns retryable error
-            Consumer->>Kafka: Re-send job to topic (reschedule)
-        else Handler returns non-retryable error
-            Consumer->>Consumer: Log error, move on
-        else Handler returns nil
-            Consumer->>Consumer: Success, move on
+    Consumer->>Kafka: PollFetches(ctx)
+    Kafka-->>Consumer: Batch of records (across partitions)
+
+    par Per partition (parallel)
+        loop For each record in partition (sequential)
+            Consumer->>Kafka: CommitRecords (synchronous, returns error)
+            alt Commit fails
+                Consumer->>Consumer: Log error, record metric, skip record
+            else Commit succeeds
+                Consumer->>Consumer: Unmarshal JSON → kafkaJob → job.Job
+                Consumer->>Handler: handler(ctx, job)
+                alt Handler returns retryable error
+                    Consumer->>Kafka: Re-send job to topic (reschedule)
+                else Handler returns non-retryable error
+                    Consumer->>Consumer: Log error, move on
+                else Handler returns nil
+                    Consumer->>Consumer: Success, move on
+                end
+            end
         end
     end
+
+    Consumer->>Consumer: Wait for all partitions to finish
+    Consumer->>Kafka: PollFetches(ctx) (next batch)
 ```
 
 ### Parallelism
 
-Kafka internally runs one goroutine per assigned partition. You do not configure this — it is driven by how many partitions Kafka assigns to your consumer during rebalancing.
+Each call to `PollFetches` returns records from all assigned partitions. The consumer spawns one goroutine per partition and waits for all to finish before polling the next batch.
 
 ```mermaid
 graph TD
     subgraph "Instance 1 (single Go process)"
-        CG1["ConsumerGroup.Consume()"]
-        CG1 --> G1["goroutine: ConsumeClaim(partition 0)"]
-        CG1 --> G2["goroutine: ConsumeClaim(partition 1)"]
-        CG1 --> G3["goroutine: ConsumeClaim(partition 2)"]
+        PF1["PollFetches()"] --> G1["goroutine: partition 0 records"]
+        PF1 --> G2["goroutine: partition 1 records"]
+        PF1 --> G3["goroutine: partition 2 records"]
+        G1 --> W1["WaitGroup.Wait()"]
+        G2 --> W1
+        G3 --> W1
+        W1 --> PF1
     end
 
     subgraph "Instance 2 (single Go process)"
-        CG2["ConsumerGroup.Consume()"]
-        CG2 --> G4["goroutine: ConsumeClaim(partition 3)"]
-        CG2 --> G5["goroutine: ConsumeClaim(partition 4)"]
-        CG2 --> G6["goroutine: ConsumeClaim(partition 5)"]
+        PF2["PollFetches()"] --> G4["goroutine: partition 3 records"]
+        PF2 --> G5["goroutine: partition 4 records"]
+        PF2 --> G6["goroutine: partition 5 records"]
+        G4 --> W2["WaitGroup.Wait()"]
+        G5 --> W2
+        G6 --> W2
+        W2 --> PF2
     end
 ```
 
 ### Scaling behavior
 
-1. **Instance 1 starts** — gets all 6 partitions, runs 6 goroutines
+1. **Instance 1 starts** — gets all 6 partitions, processes up to 6 in parallel
 2. **Instance 2 starts** — triggers rebalance, each instance gets 3 partitions
 3. **Instance 2 dies** — triggers rebalance, instance 1 gets all 6 back
 
@@ -91,12 +111,15 @@ Maximum useful consumers = number of partitions. Extra consumers sit idle as hot
 
 We commit the offset **before** processing the job. This is a deliberate design choice driven by the fact that our job (generating a JWT and sending it to a webhook) is **not idempotent** — sending two different JWTs for the same request is worse than losing a single job.
 
+With franz-go, `CommitRecords` is synchronous and returns an error. If the commit fails, we skip the record entirely — it will be redelivered on the next poll.
+
 ### Message processing flow
 
 ```mermaid
 graph TD
-    A[Receive message] --> B[Commit offset]
-    B --> C[Unmarshal JSON]
+    A[Receive record] --> B[CommitRecords]
+    B -->|error| B1[Log + metric, skip]
+    B -->|success| C[Unmarshal JSON]
     C --> D[Call handler]
     D --> E{Handler result?}
     E -->|success| F[Done]
@@ -113,7 +136,7 @@ graph TD
 
 | Failure point | What happens | Job lost? |
 |---|---|---|
-| Before offset commit | Offset not committed. On restart, message is redelivered. | No |
+| Commit fails | Record skipped, will be redelivered on next poll. | No |
 | **After commit, before handler starts** | **Offset committed, handler never ran.** | **YES** |
 | **During handler execution (before webhook)** | **Offset committed, JWT never sent.** | **YES** |
 | After webhook sent, before response received | Ambiguous — webhook may or may not have received the JWT. This is unavoidable in any distributed system. | Maybe |
@@ -140,7 +163,7 @@ sequenceDiagram
     participant Handler
 
     Kafka->>Consumer: Message (job-1, retryCount=0)
-    Consumer->>Kafka: Commit offset
+    Consumer->>Kafka: CommitRecords (success)
     Consumer->>Handler: handler(ctx, job)
     Handler-->>Consumer: RetryableError("webhook timeout")
     Consumer->>Consumer: job.Reschedule(now)
@@ -148,7 +171,7 @@ sequenceDiagram
     Note over Kafka: Job re-enters the topic<br/>with new event ID
 
     Kafka->>Consumer: Message (job-1, retryCount=1)
-    Consumer->>Kafka: Commit offset
+    Consumer->>Kafka: CommitRecords (success)
     Consumer->>Handler: handler(ctx, job)
     Handler-->>Consumer: nil (success)
 ```
@@ -168,16 +191,35 @@ sequenceDiagram
 
     Signal->>App: SIGTERM
     App->>App: Cancel context
-    Note over Consumer: claim.Messages() channels close
-    Consumer->>Consumer: Current handler call finishes (not interrupted)
-    Consumer->>Consumer: ConsumeClaim returns
-    Consumer->>Kafka: Cleanup (leave group)
+    Note over Consumer: PollFetches returns (ctx cancelled)
+    Consumer->>Consumer: WaitGroup.Wait() — in-flight partitions finish
+    Consumer->>Consumer: Start() returns
     App->>Consumer: Close()
-    Consumer->>Kafka: Send LeaveGroup request
+    Consumer->>Kafka: LeaveGroup
     Note over Kafka: Remaining consumers<br/>get rebalanced immediately
 ```
 
-The key guarantee: **in-flight jobs are not interrupted.** Because the handler runs synchronously within `ConsumeClaim`, the current job will finish before the consumer shuts down.
+The key guarantee: **in-flight jobs are not interrupted.** The WaitGroup ensures all partition goroutines finish their current record before shutdown proceeds.
+
+---
+
+## Metrics
+
+All metrics are defined in the `otel` package and recorded via function calls (no metric instruments leak into the kafka package).
+
+| Metric | Type | Description |
+|---|---|---|
+| `keepie.jobs.produced` | Counter | Jobs sent to Kafka |
+| `keepie.jobs.consumed` | Counter | Jobs received from Kafka |
+| `keepie.jobs.processed` | Counter | Jobs processed successfully |
+| `keepie.jobs.failed` | Counter | Jobs failed with non-retryable error |
+| `keepie.jobs.rescheduled` | Counter | Jobs rescheduled after retryable error |
+| `keepie.jobs.unmarshal_errors` | Counter | Messages that failed to unmarshal |
+| `keepie.consumer.offset_commit_errors` | Counter | Offset commits that failed |
+| `keepie.jobs.processing_duration_seconds` | Histogram | Time spent in the handler |
+| `keepie.jobs.time_in_queue_seconds` | Histogram | Time between creation/rescheduling and consumption |
+
+All counters carry a `topic` attribute.
 
 ---
 
@@ -278,7 +320,7 @@ sequenceDiagram
 
 ### Test 5: Retryable Error
 
-**What it tests:** When a handler returns a retryable error, the job is rescheduled with a new event ID and incremented retry count. The second attempt succeeds.
+**What it tests:** When a handler returns a retryable error, the job is rescheduled with incremented retry count. The second attempt succeeds.
 
 ```mermaid
 sequenceDiagram
