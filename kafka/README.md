@@ -1,0 +1,289 @@
+# Kafka Client
+
+## Configuration
+
+| Setting | Value | Why |
+|---|---|---|
+| Partitions | 6 | Target: 2 instances x 2 workers = 4, with headroom for scaling |
+| Offset commit | Manual, commit-first | Commit before processing to prevent duplicate JWTs |
+| Partitioning | Round-robin (no key) | Jobs are independent, we want even distribution |
+| Auto-offset-reset | `earliest` | On first start or expired offsets, process from beginning rather than skip |
+
+---
+
+## How the client works
+
+### Producer
+
+The producer sends job messages to the Kafka topic. Messages are JSON-encoded and distributed across partitions using round-robin (no message key).
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant Producer
+    participant Kafka
+
+    App->>Producer: Send(ctx, topic, job)
+    Producer->>Producer: Convert job.Job → kafkaJob (add JSON tags)
+    Producer->>Producer: Marshal to JSON
+    Producer->>Kafka: Send message (round-robin partition)
+    Kafka-->>Producer: Acknowledgment
+    Producer-->>App: nil (success)
+```
+
+### Consumer
+
+The consumer joins a consumer group. Kafka assigns partitions to it. For each assigned partition, a separate goroutine runs `ConsumeClaim`, processing messages sequentially within that partition.
+
+```mermaid
+sequenceDiagram
+    participant Kafka
+    participant Consumer
+    participant Handler
+
+    loop For each message in partition
+        Kafka->>Consumer: Deliver message
+        Consumer->>Kafka: Commit offset (before processing!)
+        Consumer->>Consumer: Unmarshal JSON → kafkaJob → job.Job
+        Consumer->>Handler: handler(ctx, job)
+        alt Handler returns retryable error
+            Consumer->>Kafka: Re-send job to topic (reschedule)
+        else Handler returns non-retryable error
+            Consumer->>Consumer: Log error, move on
+        else Handler returns nil
+            Consumer->>Consumer: Success, move on
+        end
+    end
+```
+
+### Parallelism
+
+Kafka internally runs one goroutine per assigned partition. You do not configure this — it is driven by how many partitions Kafka assigns to your consumer during rebalancing.
+
+```mermaid
+graph TD
+    subgraph "Instance 1 (single Go process)"
+        CG1["ConsumerGroup.Consume()"]
+        CG1 --> G1["goroutine: ConsumeClaim(partition 0)"]
+        CG1 --> G2["goroutine: ConsumeClaim(partition 1)"]
+        CG1 --> G3["goroutine: ConsumeClaim(partition 2)"]
+    end
+
+    subgraph "Instance 2 (single Go process)"
+        CG2["ConsumerGroup.Consume()"]
+        CG2 --> G4["goroutine: ConsumeClaim(partition 3)"]
+        CG2 --> G5["goroutine: ConsumeClaim(partition 4)"]
+        CG2 --> G6["goroutine: ConsumeClaim(partition 5)"]
+    end
+```
+
+### Scaling behavior
+
+1. **Instance 1 starts** — gets all 6 partitions, runs 6 goroutines
+2. **Instance 2 starts** — triggers rebalance, each instance gets 3 partitions
+3. **Instance 2 dies** — triggers rebalance, instance 1 gets all 6 back
+
+Maximum useful consumers = number of partitions. Extra consumers sit idle as hot standbys.
+
+---
+
+## Commit-first strategy and failure points
+
+We commit the offset **before** processing the job. This is a deliberate design choice driven by the fact that our job (generating a JWT and sending it to a webhook) is **not idempotent** — sending two different JWTs for the same request is worse than losing a single job.
+
+### Message processing flow
+
+```mermaid
+graph TD
+    A[Receive message] --> B[Commit offset]
+    B --> C[Unmarshal JSON]
+    C --> D[Call handler]
+    D --> E{Handler result?}
+    E -->|success| F[Done]
+    E -->|retryable error| G[Re-send to topic]
+    E -->|non-retryable error| H[Log error]
+
+    style B fill:#ff9999,stroke:#cc0000
+    style D fill:#ff9999,stroke:#cc0000
+```
+
+### Where jobs can be lost
+
+> **The red-highlighted steps above are the danger zones.** A crash at these points means a committed offset with no processing.
+
+| Failure point | What happens | Job lost? |
+|---|---|---|
+| Before offset commit | Offset not committed. On restart, message is redelivered. | No |
+| **After commit, before handler starts** | **Offset committed, handler never ran.** | **YES** |
+| **During handler execution (before webhook)** | **Offset committed, JWT never sent.** | **YES** |
+| After webhook sent, before response received | Ambiguous — webhook may or may not have received the JWT. This is unavoidable in any distributed system. | Maybe |
+| After successful handler return | Everything succeeded. | No |
+
+**Why this is acceptable:** A lost job can be recovered — the client can retry their request. But a duplicate JWT (two different tokens for the same request) creates real confusion that cannot be automatically resolved.
+
+### Retryable errors
+
+When a handler returns an error wrapped with `job.MakeRetryable()`, the consumer re-sends the job to the topic. The job will be picked up again (possibly by a different consumer/partition).
+
+```mermaid
+sequenceDiagram
+    participant Kafka
+    participant Consumer
+    participant Handler
+
+    Kafka->>Consumer: Message (job-1, evt-1)
+    Consumer->>Kafka: Commit offset
+    Consumer->>Handler: handler(ctx, job)
+    Handler-->>Consumer: RetryableError("webhook timeout")
+    Consumer->>Kafka: Re-send (job-1, evt-1) to topic
+    Note over Kafka: Job re-enters the topic<br/>and will be delivered again
+
+    Kafka->>Consumer: Message (job-1, evt-1) [redelivered]
+    Consumer->>Kafka: Commit offset
+    Consumer->>Handler: handler(ctx, job)
+    Handler-->>Consumer: nil (success)
+```
+
+> Note: the re-sent job keeps the same event ID and job ID. If the handler needs to generate a new event ID for each attempt, this should be done at a higher level.
+
+---
+
+## Graceful shutdown
+
+When the service receives a shutdown signal (SIGINT/SIGTERM):
+
+```mermaid
+sequenceDiagram
+    participant Signal
+    participant App
+    participant Consumer
+    participant Kafka
+
+    Signal->>App: SIGTERM
+    App->>App: Cancel context
+    Note over Consumer: claim.Messages() channels close
+    Consumer->>Consumer: Current handler call finishes (not interrupted)
+    Consumer->>Consumer: ConsumeClaim returns
+    Consumer->>Kafka: Cleanup (leave group)
+    App->>Consumer: Close()
+    Consumer->>Kafka: Send LeaveGroup request
+    Note over Kafka: Remaining consumers<br/>get rebalanced immediately
+```
+
+The key guarantee: **in-flight jobs are not interrupted.** Because the handler runs synchronously within `ConsumeClaim`, the current job will finish before the consumer shuts down.
+
+---
+
+## Integration tests
+
+All tests use [testcontainers-go](https://github.com/testcontainers/testcontainers-go) to spin up a real Kafka instance in Docker. No manual setup needed.
+
+Run with:
+```bash
+go test -tags=integration -v -timeout 300s ./kafka/...
+```
+
+### Test 1: Produce and Consume
+
+**What it tests:** Basic end-to-end message flow — a produced message arrives at the consumer with all fields intact.
+
+```mermaid
+sequenceDiagram
+    participant Test
+    participant Producer
+    participant Kafka
+    participant Consumer
+
+    Test->>Producer: Send job (evt-1, job-1, webhook-url)
+    Producer->>Kafka: Message
+    Kafka->>Consumer: Deliver message
+    Consumer->>Test: Received job
+    Test->>Test: Assert: ID, JobID, WebhookURL, CreatedAt match
+```
+
+### Test 2: Workload Distribution
+
+**What it tests:** 200 messages are distributed across 2 consumers in the same group. Each message is processed by exactly one consumer — no duplicates, no missed messages.
+
+```mermaid
+graph LR
+    P[Producer<br/>200 messages] --> K[Kafka<br/>6 partitions]
+    K --> C1[Consumer 1<br/>~100 messages]
+    K --> C2[Consumer 2<br/>~100 messages]
+
+    subgraph "Same consumer group"
+        C1
+        C2
+    end
+```
+
+**Assertions:**
+- Total messages received = 200
+- Both consumers received at least 1 message
+- No duplicate message IDs across consumers
+
+### Test 3: Consumer Rebalancing
+
+**What it tests:** When a consumer leaves the group, its partitions are reassigned to the remaining consumer.
+
+```mermaid
+sequenceDiagram
+    participant Test
+    participant C1 as Consumer 1
+    participant C2 as Consumer 2
+    participant Kafka
+
+    Note over C1,C2: Phase 1: Both consumers active
+    Test->>Kafka: Send 5 messages
+    Kafka->>C1: Some messages
+    Kafka->>C2: Some messages
+
+    Test->>C1: Stop (cancel context + close)
+    Note over Kafka: Rebalance: all partitions → Consumer 2
+
+    Note over C2: Phase 2: Only Consumer 2 active
+    Test->>Kafka: Send 5 more messages
+    Kafka->>C2: All 5 messages
+    Test->>Test: Assert: Consumer 2 received all phase 2 messages
+```
+
+### Test 4: Offset Persistence
+
+**What it tests:** After a consumer commits offsets and restarts, a new consumer in the same group resumes from where the previous one left off — it does not re-receive already committed messages.
+
+```mermaid
+sequenceDiagram
+    participant Test
+    participant C1 as Consumer 1
+    participant C2 as Consumer 2
+    participant Kafka
+
+    Test->>Kafka: Send 3 messages (evt-0, evt-1, evt-2)
+    Kafka->>C1: Deliver all 3
+    C1->>Kafka: Commit offsets
+    Test->>C1: Stop
+
+    Test->>Kafka: Send 2 more (evt-3, evt-4)
+    Test->>C2: Start (same group ID)
+    Kafka->>C2: Deliver only evt-3, evt-4
+    Test->>Test: Assert: exactly 2 messages, no redelivery
+```
+
+### Test 5: Retryable Error
+
+**What it tests:** When a handler returns a retryable error, the job is re-sent to the topic and processed again. The second attempt succeeds.
+
+```mermaid
+sequenceDiagram
+    participant Test
+    participant Consumer
+    participant Kafka
+
+    Test->>Kafka: Send job (job-1)
+    Kafka->>Consumer: Deliver job-1 (attempt 1)
+    Consumer->>Consumer: Handler returns RetryableError
+    Consumer->>Kafka: Re-send job-1
+    Kafka->>Consumer: Deliver job-1 (attempt 2)
+    Consumer->>Consumer: Handler returns nil (success)
+    Test->>Test: Assert: 2 total attempts for job-1
+```
