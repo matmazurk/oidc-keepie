@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/matmazurk/oidc-keepie/job"
@@ -98,24 +97,19 @@ func (c *Consumer) Start(ctx context.Context) error {
 			)
 		}
 
-		var wg sync.WaitGroup
-		fetches.EachPartition(func(p kgo.FetchTopicPartition) {
-			wg.Go(func() {
-				for _, record := range p.Records {
-					c.processRecord(ctx, record)
-				}
-			})
+		fetches.EachRecord(func(record *kgo.Record) {
+			c.processRecord(ctx, record)
 		})
-		wg.Wait()
 	}
 }
 
 func (c *Consumer) processRecord(ctx context.Context, record *kgo.Record) {
-	received := time.Now()
 	slog.Debug("received record",
 		slog.Int("partition", int(record.Partition)),
 		slog.Int64("offset", record.Offset),
 	)
+
+	received := time.Now()
 
 	var kj kafkaJob
 	if err := json.Unmarshal(record.Value, &kj); err != nil {
