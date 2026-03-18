@@ -21,8 +21,12 @@ func New(jobID, webhookURL string, createdAt time.Time) (Job, error) {
 	if webhookURL == "" {
 		return Job{}, errors.New("webhookURL must not be empty")
 	}
-	if _, err := url.ParseRequestURI(webhookURL); err != nil {
+	u, err := url.ParseRequestURI(webhookURL)
+	if err != nil {
 		return Job{}, errors.New("webhookURL must be a valid URL")
+	}
+	if u.Scheme != "https" {
+		return Job{}, errors.New("webhookURL must use HTTPS")
 	}
 	if createdAt.IsZero() {
 		return Job{}, errors.New("createdAt must not be zero")
