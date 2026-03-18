@@ -67,7 +67,7 @@ func TestProduceAndConsume(t *testing.T) {
 	ctx := t.Context()
 
 	now := time.Now().Truncate(time.Second)
-	j := job.MustNew("evt-1", "job-1", "https://example.com/webhook", now)
+	j := job.MustNew("job-1", "https://example.com/webhook", now)
 
 	if err := producer.Send(ctx, topic, j); err != nil {
 		t.Fatalf("sending message: %v", err)
@@ -91,9 +91,6 @@ func TestProduceAndConsume(t *testing.T) {
 
 	select {
 	case got := <-received:
-		if got.ID() != "evt-1" {
-			t.Errorf("expected ID evt-1, got %s", got.ID())
-		}
 		if got.JobID() != "job-1" {
 			t.Errorf("expected JobID job-1, got %s", got.JobID())
 		}
@@ -102,6 +99,12 @@ func TestProduceAndConsume(t *testing.T) {
 		}
 		if !got.CreatedAt().Equal(now) {
 			t.Errorf("expected CreatedAt %v, got %v", now, got.CreatedAt())
+		}
+		if got.RetryCount() != 0 {
+			t.Errorf("expected RetryCount 0, got %d", got.RetryCount())
+		}
+		if !got.RescheduledAt().IsZero() {
+			t.Errorf("expected RescheduledAt to be zero, got %v", got.RescheduledAt())
 		}
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for message")
@@ -134,7 +137,7 @@ func TestWorkloadDistribution(t *testing.T) {
 		return func(ctx context.Context, j job.Job) error {
 			mu.Lock()
 			defer mu.Unlock()
-			receivedByConsumer[name] = append(receivedByConsumer[name], j.ID())
+			receivedByConsumer[name] = append(receivedByConsumer[name], j.JobID())
 			total := len(receivedByConsumer["consumer-1"]) + len(receivedByConsumer["consumer-2"])
 			if total == messageCount {
 				close(allReceived)
@@ -172,7 +175,6 @@ func TestWorkloadDistribution(t *testing.T) {
 
 	for i := range messageCount {
 		j := job.MustNew(
-			fmt.Sprintf("evt-%d", i),
 			fmt.Sprintf("job-%d", i),
 			"https://example.com/webhook",
 			now,
@@ -248,9 +250,9 @@ func TestConsumerRebalancing(t *testing.T) {
 
 	consumer1, err := kfk.NewConsumer(brokers, groupID, producer, func(ctx context.Context, j job.Job) error {
 		mu.Lock()
-		consumer1Messages = append(consumer1Messages, j.ID())
+		consumer1Messages = append(consumer1Messages, j.JobID())
 		mu.Unlock()
-		consumer1Received <- j.ID()
+		consumer1Received <- j.JobID()
 		return nil
 	})
 	if err != nil {
@@ -259,9 +261,9 @@ func TestConsumerRebalancing(t *testing.T) {
 
 	consumer2, err := kfk.NewConsumer(brokers, groupID, producer, func(ctx context.Context, j job.Job) error {
 		mu.Lock()
-		consumer2Messages = append(consumer2Messages, j.ID())
+		consumer2Messages = append(consumer2Messages, j.JobID())
 		mu.Unlock()
-		consumer2Received <- j.ID()
+		consumer2Received <- j.JobID()
 		return nil
 	})
 	if err != nil {
@@ -288,7 +290,7 @@ func TestConsumerRebalancing(t *testing.T) {
 
 	// send messages while both consumers are active
 	for i := range 5 {
-		j := job.MustNew(fmt.Sprintf("evt-phase1-%d", i), fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
+		j := job.MustNew(fmt.Sprintf("job-phase1-%d", i), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, topic, j); err != nil {
 			t.Fatalf("sending phase 1 message %d: %v", i, err)
 		}
@@ -316,7 +318,7 @@ func TestConsumerRebalancing(t *testing.T) {
 
 	// send more messages — consumer 2 should get all of them
 	for i := range 5 {
-		j := job.MustNew(fmt.Sprintf("evt-phase2-%d", i), fmt.Sprintf("job-phase2-%d", i), "https://example.com/webhook", now)
+		j := job.MustNew(fmt.Sprintf("job-phase2-%d", i), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, topic, j); err != nil {
 			t.Fatalf("sending phase 2 message %d: %v", i, err)
 		}
@@ -360,7 +362,7 @@ func TestOffsetPersistence(t *testing.T) {
 
 	// send 3 messages
 	for i := range 3 {
-		j := job.MustNew(fmt.Sprintf("evt-%d", i), fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
+		j := job.MustNew(fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, topic, j); err != nil {
 			t.Fatalf("sending message %d: %v", i, err)
 		}
@@ -369,7 +371,7 @@ func TestOffsetPersistence(t *testing.T) {
 	// consume all 3 messages with first consumer
 	received1 := make(chan string, 10)
 	consumer1, err := kfk.NewConsumer(brokers, groupID, producer, func(ctx context.Context, j job.Job) error {
-		received1 <- j.ID()
+		received1 <- j.JobID()
 		return nil
 	})
 	if err != nil {
@@ -400,7 +402,7 @@ func TestOffsetPersistence(t *testing.T) {
 
 	// send 2 more messages
 	for i := 3; i < 5; i++ {
-		j := job.MustNew(fmt.Sprintf("evt-%d", i), fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
+		j := job.MustNew(fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, topic, j); err != nil {
 			t.Fatalf("sending message %d: %v", i, err)
 		}
@@ -409,7 +411,7 @@ func TestOffsetPersistence(t *testing.T) {
 	// start a new consumer in the same group — should only get the 2 new messages
 	received2 := make(chan string, 10)
 	consumer2, err := kfk.NewConsumer(brokers, groupID, producer, func(ctx context.Context, j job.Job) error {
-		received2 <- j.ID()
+		received2 <- j.JobID()
 		return nil
 	})
 	if err != nil {
@@ -466,6 +468,7 @@ func TestRetryableError(t *testing.T) {
 
 	var mu sync.Mutex
 	attempts := map[string]int{}
+	var retriedJob job.Job
 	done := make(chan struct{})
 
 	consumer, err := kfk.NewConsumer(brokers, groupID, producer, func(ctx context.Context, j job.Job) error {
@@ -478,6 +481,9 @@ func TestRetryableError(t *testing.T) {
 			return job.MakeRetryable(fmt.Errorf("temporary failure"))
 		}
 
+		mu.Lock()
+		retriedJob = j
+		mu.Unlock()
 		close(done)
 		return nil
 	})
@@ -492,7 +498,7 @@ func TestRetryableError(t *testing.T) {
 		}
 	}()
 
-	j := job.MustNew("evt-1", "job-1", "https://example.com/webhook", now)
+	j := job.MustNew("job-1", "https://example.com/webhook", now)
 	if err := producer.Send(ctx, topic, j); err != nil {
 		t.Fatalf("sending message: %v", err)
 	}
@@ -508,5 +514,17 @@ func TestRetryableError(t *testing.T) {
 
 	if attempts["job-1"] != 2 {
 		t.Errorf("expected 2 attempts, got %d", attempts["job-1"])
+	}
+	if retriedJob.JobID() != "job-1" {
+		t.Errorf("expected retried job to keep jobID job-1, got %s", retriedJob.JobID())
+	}
+	if retriedJob.RetryCount() != 1 {
+		t.Errorf("expected retry count 1, got %d", retriedJob.RetryCount())
+	}
+	if retriedJob.RescheduledAt().IsZero() {
+		t.Error("expected rescheduledAt to be set")
+	}
+	if !retriedJob.CreatedAt().Equal(now) {
+		t.Errorf("expected createdAt to be preserved, got %v", retriedJob.CreatedAt())
 	}
 }

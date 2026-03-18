@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/IBM/sarama"
 	"github.com/matmazurk/oidc-keepie/job"
@@ -128,13 +129,18 @@ func (h *groupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim s
 
 		if err := h.handler(session.Context(), j); err != nil {
 			if job.IsRetryable(err) {
-				slog.Info("rescheduling retryable job", slog.String("job_id", j.ID()), slog.String("error", err.Error()))
-				if sendErr := h.producer.Send(session.Context(), h.topic, j); sendErr != nil {
-					slog.Error("rescheduling job", slog.String("job_id", j.ID()), slog.String("error", sendErr.Error()))
+				rescheduled := j.Reschedule(time.Now())
+				slog.Info("rescheduling retryable job",
+					slog.String("job_id", j.JobID()),
+					slog.Int("retry_count", rescheduled.RetryCount()),
+					slog.String("error", err.Error()),
+				)
+				if sendErr := h.producer.Send(session.Context(), h.topic, rescheduled); sendErr != nil {
+					slog.Error("rescheduling job", slog.String("job_id", j.JobID()), slog.String("error", sendErr.Error()))
 				}
 				continue
 			}
-			slog.Error("handling job", slog.String("job_id", j.ID()), slog.String("error", err.Error()))
+			slog.Error("handling job", slog.String("job_id", j.JobID()), slog.String("error", err.Error()))
 		}
 	}
 	return nil
