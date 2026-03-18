@@ -8,7 +8,7 @@ Uses [franz-go](https://github.com/twmb/franz-go) (`kgo`) for both producing and
 |---|---|---|
 | Library | `twmb/franz-go` | Synchronous `CommitRecords` returns error, unlike sarama's fire-and-forget |
 | Partitions | 6 | 2 instances × 3 partitions each = 6 concurrent workers, with room to scale to 6 instances |
-| Offset commit | Manual, commit-first | Commit before processing to prevent duplicate JWTs |
+| Offset commit | Manual, after unmarshal | Commit after successful unmarshal to prevent duplicate JWTs while allowing redelivery on unmarshal crash |
 | Partitioning | Round-robin (no key) | Jobs are independent, we want even distribution |
 | Auto-offset-reset | `earliest` | On first start or expired offsets, process from beginning rather than skip |
 
@@ -49,18 +49,23 @@ sequenceDiagram
 
     par Per partition (parallel)
         loop For each record in partition (sequential)
-            Consumer->>Kafka: CommitRecords (synchronous, returns error)
-            alt Commit fails
-                Consumer->>Consumer: Log error, record metric, skip record
-            else Commit succeeds
-                Consumer->>Consumer: Unmarshal JSON → kafkaJob → job.Job
-                Consumer->>Handler: handler(ctx, job)
-                alt Handler returns retryable error
-                    Consumer->>Kafka: Re-send job to topic (reschedule)
-                else Handler returns non-retryable error
-                    Consumer->>Consumer: Log error, move on
-                else Handler returns nil
-                    Consumer->>Consumer: Success, move on
+            Consumer->>Consumer: Unmarshal JSON → kafkaJob → job.Job
+            alt Unmarshal fails
+                Consumer->>Consumer: Log error, record metric
+                Consumer->>Kafka: CommitRecords (skip bad message)
+            else Unmarshal succeeds
+                Consumer->>Kafka: CommitRecords (synchronous, returns error)
+                alt Commit fails
+                    Consumer->>Consumer: Log error, record metric, skip record
+                else Commit succeeds
+                    Consumer->>Handler: handler(ctx, job)
+                    alt Handler returns retryable error
+                        Consumer->>Kafka: Re-send job to topic (reschedule)
+                    else Handler returns non-retryable error
+                        Consumer->>Consumer: Log error, move on
+                    else Handler returns nil
+                        Consumer->>Consumer: Success, move on
+                    end
                 end
             end
         end
@@ -107,9 +112,13 @@ Maximum useful consumers = number of partitions. Extra consumers sit idle as hot
 
 ---
 
-## Commit-first strategy and failure points
+## Commit strategy and failure points
 
-We commit the offset **before** processing the job. This is a deliberate design choice driven by the fact that our job (generating a JWT and sending it to a webhook) is **not idempotent** — sending two different JWTs for the same request is worse than losing a single job.
+We commit the offset **after unmarshal but before processing** the job. This is a deliberate design choice:
+
+- **Unmarshal before commit:** If the instance crashes during unmarshal, the offset hasn't been committed, so the message will be redelivered. This is safe because unmarshal is a pure operation.
+- **Commit before handler:** Once committed, the job won't be redelivered. This prevents duplicate JWTs since our job (generating a JWT and sending it to a webhook) is **not idempotent**.
+- **Bad messages:** If unmarshal fails (corrupt data), we commit the offset anyway to avoid infinite redelivery loops. The error is logged and a metric is recorded.
 
 With franz-go, `CommitRecords` is synchronous and returns an error. If the commit fails, we skip the record entirely — it will be redelivered on the next poll.
 
@@ -117,16 +126,17 @@ With franz-go, `CommitRecords` is synchronous and returns an error. If the commi
 
 ```mermaid
 graph TD
-    A[Receive record] --> B[CommitRecords]
-    B -->|error| B1[Log + metric, skip]
-    B -->|success| C[Unmarshal JSON]
-    C --> D[Call handler]
+    A[Receive record] --> B[Unmarshal JSON]
+    B -->|error| B1[Log + metric, commit to skip]
+    B -->|success| C[CommitRecords]
+    C -->|error| C1[Log + metric, skip]
+    C -->|success| D[Call handler]
     D --> E{Handler result?}
     E -->|success| F[Done]
     E -->|retryable error| G[Re-send to topic]
     E -->|non-retryable error| H[Log error]
 
-    style B fill:#ff9999,stroke:#cc0000
+    style C fill:#ff9999,stroke:#cc0000
     style D fill:#ff9999,stroke:#cc0000
 ```
 
@@ -136,6 +146,8 @@ graph TD
 
 | Failure point | What happens | Job lost? |
 |---|---|---|
+| Unmarshal fails (corrupt data) | Offset committed to skip bad message. Original job data was invalid. | N/A (not a valid job) |
+| Crash during unmarshal | Offset not yet committed, message will be redelivered. | No |
 | Commit fails | Record skipped, will be redelivered on next poll. | No |
 | **After commit, before handler starts** | **Offset committed, handler never ran.** | **YES** |
 | **During handler execution (before webhook)** | **Offset committed, JWT never sent.** | **YES** |
@@ -163,6 +175,7 @@ sequenceDiagram
     participant Handler
 
     Kafka->>Consumer: Message (job-1, retryCount=0)
+    Consumer->>Consumer: Unmarshal (success)
     Consumer->>Kafka: CommitRecords (success)
     Consumer->>Handler: handler(ctx, job)
     Handler-->>Consumer: RetryableError("webhook timeout")
@@ -171,6 +184,7 @@ sequenceDiagram
     Note over Kafka: Job re-enters the topic<br/>with new event ID
 
     Kafka->>Consumer: Message (job-1, retryCount=1)
+    Consumer->>Consumer: Unmarshal (success)
     Consumer->>Kafka: CommitRecords (success)
     Consumer->>Handler: handler(ctx, job)
     Handler-->>Consumer: nil (success)
@@ -205,11 +219,13 @@ The key guarantee: **in-flight jobs are not interrupted.** The WaitGroup ensures
 
 ## Metrics
 
-All metrics are defined in the `otel` package and recorded via function calls (no metric instruments leak into the kafka package).
+All metrics are defined in the `otel` package and recorded via function calls (no metric instruments leak into other packages).
+
+### Kafka metrics
 
 | Metric | Type | Description |
 |---|---|---|
-| `keepie.jobs.produced` | Counter | Jobs sent to Kafka |
+| `keepie.jobs.scheduled` | Counter | Jobs sent to Kafka |
 | `keepie.jobs.consumed` | Counter | Jobs received from Kafka |
 | `keepie.jobs.processed` | Counter | Jobs processed successfully |
 | `keepie.jobs.failed` | Counter | Jobs failed with non-retryable error |
@@ -219,7 +235,35 @@ All metrics are defined in the `otel` package and recorded via function calls (n
 | `keepie.jobs.processing_duration_seconds` | Histogram | Time spent in the handler |
 | `keepie.jobs.time_in_queue_seconds` | Histogram | Time between creation/rescheduling and consumption |
 
-All counters carry a `topic` attribute.
+### HTTP metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `keepie.http.requests` | Counter | Number of HTTP handler executions |
+| `keepie.http.invalid_bodies` | Counter | Requests with invalid or unparseable bodies |
+| `keepie.http.duration_seconds` | Histogram | Duration of HTTP handler execution |
+
+---
+
+## HTTP API
+
+The `api` package exposes an HTTP handler for scheduling jobs. The handler depends on a `JobScheduler` interface (implemented by `kafka.Producer`).
+
+### `POST /jobs`
+
+**Request:**
+```json
+{"webhook_url": "https://example.com/callback"}
+```
+
+**Response (202 Accepted):**
+```json
+{"job_id": "550e8400-e29b-41d4-a716-446655440000"}
+```
+
+**Errors:**
+- `400 Bad Request` — invalid JSON, empty webhook URL, or invalid URL
+- `500 Internal Server Error` — scheduler failed to send the job
 
 ---
 

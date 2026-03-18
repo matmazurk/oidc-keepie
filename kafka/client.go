@@ -45,8 +45,9 @@ func (p *Producer) Send(ctx context.Context, j job.Job) error {
 	if err := results.FirstErr(); err != nil {
 		return fmt.Errorf("sending message: %w", err)
 	}
-	slog.Debug("produced job", slog.String("job_id", j.JobID()))
-	keepieotel.JobProduced(ctx)
+	keepieotel.JobScheduled(ctx)
+	slog.Debug("scheduled job", slog.String("job_id", j.JobID()))
+
 	return nil
 }
 
