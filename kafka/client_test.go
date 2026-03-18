@@ -466,3 +466,68 @@ func TestOffsetPersistence(t *testing.T) {
 	}
 	t.Logf("second consumer received: %v", newMessages)
 }
+
+func TestRetryableError(t *testing.T) {
+	topic := fmt.Sprintf("test-retryable-%d", time.Now().UnixNano())
+	createTopic(t, topic, 6)
+	groupID := fmt.Sprintf("test-group-retryable-%d", time.Now().UnixNano())
+
+	producer, err := kfk.NewProducer(brokers)
+	if err != nil {
+		t.Fatalf("creating producer: %v", err)
+	}
+	defer producer.Close()
+
+	now := time.Now().Truncate(time.Second)
+
+	var mu sync.Mutex
+	attempts := map[string]int{}
+	done := make(chan struct{})
+
+	consumer, err := kfk.NewConsumer(brokers, groupID, producer, func(ctx context.Context, j job.Job) error {
+		mu.Lock()
+		attempts[j.JobID()]++
+		attempt := attempts[j.JobID()]
+		mu.Unlock()
+
+		if attempt == 1 {
+			return job.MakeRetryable(fmt.Errorf("temporary failure"))
+		}
+
+		close(done)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("creating consumer: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	go func() {
+		if err := consumer.Start(ctx, topic); err != nil {
+			t.Logf("consumer stopped: %v", err)
+		}
+	}()
+
+	j, _ := job.New("evt-1", "job-1", "https://example.com/webhook", now)
+	if err := producer.Send(ctx, topic, j); err != nil {
+		t.Fatalf("sending message: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for retried message")
+	}
+
+	cancel()
+	consumer.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if attempts["job-1"] != 2 {
+		t.Errorf("expected 2 attempts, got %d", attempts["job-1"])
+	}
+}
