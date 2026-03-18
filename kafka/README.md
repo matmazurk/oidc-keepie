@@ -7,7 +7,7 @@ Uses [franz-go](https://github.com/twmb/franz-go) (`kgo`) for both producing and
 | Setting | Value | Why |
 |---|---|---|
 | Library | `twmb/franz-go` | Synchronous `CommitRecords` returns error, unlike sarama's fire-and-forget |
-| Partitions | 6 | 2 instances × 3 partitions each = 6 concurrent workers, with room to scale to 6 instances |
+| Partitions | 2 | Allows scaling up to 2 consumer instances |
 | Offset commit | Manual, after unmarshal | Commit after successful unmarshal to prevent duplicate JWTs while allowing redelivery on unmarshal crash |
 | Partitioning | Round-robin (no key) | Jobs are independent, we want even distribution |
 | Auto-offset-reset | `earliest` | On first start or expired offsets, process from beginning rather than skip |
@@ -36,7 +36,7 @@ sequenceDiagram
 
 ### Consumer
 
-The consumer joins a consumer group. Kafka assigns partitions to it. `PollFetches` returns batches of records from all assigned partitions. Records are fanned out — one goroutine per partition processes records sequentially within that partition, while partitions are processed in parallel.
+The consumer joins a consumer group. Kafka assigns partitions to it. `PollFetches` returns batches of records from all assigned partitions. Records are processed sequentially, one at a time.
 
 ```mermaid
 sequenceDiagram
@@ -48,48 +48,23 @@ sequenceDiagram
         Consumer->>Kafka: Poll for records
         Kafka-->>Consumer: Batch of records
 
-        Note over Consumer: Process partitions in parallel,<br/>records within partition sequentially
-
-        Consumer->>Consumer: Unmarshal record
-        Consumer->>Kafka: Commit offset
-        Consumer->>Handler: Process job
+        loop Each record (sequential)
+            Consumer->>Consumer: Unmarshal record
+            Consumer->>Kafka: Commit offset
+            Consumer->>Handler: Process job
+        end
     end
 ```
 
-### Parallelism
+### Scaling
 
-Each call to `PollFetches` returns records from all assigned partitions. The consumer spawns one goroutine per partition and waits for all to finish before polling the next batch.
+Throughput scales by adding consumer instances (each gets a subset of partitions). Within a single instance, processing is sequential.
 
-```mermaid
-graph TD
-    subgraph "Instance 1 (single Go process)"
-        PF1["PollFetches()"] --> G1["goroutine: partition 0 records"]
-        PF1 --> G2["goroutine: partition 1 records"]
-        PF1 --> G3["goroutine: partition 2 records"]
-        G1 --> W1["WaitGroup.Wait()"]
-        G2 --> W1
-        G3 --> W1
-        W1 --> PF1
-    end
+1. **Instance 1 starts** — gets both partitions
+2. **Instance 2 starts** — triggers rebalance, each instance gets 1 partition
+3. **Instance 2 dies** — triggers rebalance, instance 1 gets both back
 
-    subgraph "Instance 2 (single Go process)"
-        PF2["PollFetches()"] --> G4["goroutine: partition 3 records"]
-        PF2 --> G5["goroutine: partition 4 records"]
-        PF2 --> G6["goroutine: partition 5 records"]
-        G4 --> W2["WaitGroup.Wait()"]
-        G5 --> W2
-        G6 --> W2
-        W2 --> PF2
-    end
-```
-
-### Scaling behavior
-
-1. **Instance 1 starts** — gets all 6 partitions, processes up to 6 in parallel
-2. **Instance 2 starts** — triggers rebalance, each instance gets 3 partitions
-3. **Instance 2 dies** — triggers rebalance, instance 1 gets all 6 back
-
-Maximum useful consumers = number of partitions. Extra consumers sit idle as hot standbys.
+Maximum useful consumer instances = number of partitions. Extra instances sit idle as hot standbys.
 
 ---
 
@@ -187,14 +162,13 @@ sequenceDiagram
     Signal->>App: SIGTERM
     App->>App: Cancel context
     Note over Consumer: PollFetches returns (ctx cancelled)
-    Consumer->>Consumer: WaitGroup.Wait() — in-flight partitions finish
     Consumer->>Consumer: Start() returns
     App->>Consumer: Close()
     Consumer->>Kafka: LeaveGroup
     Note over Kafka: Remaining consumers<br/>get rebalanced immediately
 ```
 
-The key guarantee: **in-flight jobs are not interrupted.** The WaitGroup ensures all partition goroutines finish their current record before shutdown proceeds.
+The current record finishes processing before `PollFetches` is called again and the context cancellation is detected.
 
 ---
 
@@ -251,7 +225,7 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    P[Producer<br/>200 messages] --> K[Kafka<br/>6 partitions]
+    P[Producer<br/>200 messages] --> K[Kafka<br/>2 partitions]
     K --> C1[Consumer 1<br/>~100 messages]
     K --> C2[Consumer 2<br/>~100 messages]
 
