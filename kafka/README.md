@@ -44,35 +44,16 @@ sequenceDiagram
     participant Consumer
     participant Handler
 
-    Consumer->>Kafka: PollFetches(ctx)
-    Kafka-->>Consumer: Batch of records (across partitions)
+    loop Poll loop
+        Consumer->>Kafka: Poll for records
+        Kafka-->>Consumer: Batch of records
 
-    par Per partition (parallel)
-        loop For each record in partition (sequential)
-            Consumer->>Consumer: Unmarshal JSON → kafkaJob → job.Job
-            alt Unmarshal fails
-                Consumer->>Consumer: Log error, record metric
-                Consumer->>Kafka: CommitRecords (skip bad message)
-            else Unmarshal succeeds
-                Consumer->>Kafka: CommitRecords (synchronous, returns error)
-                alt Commit fails
-                    Consumer->>Consumer: Log error, record metric, skip record
-                else Commit succeeds
-                    Consumer->>Handler: handler(ctx, job)
-                    alt Handler returns retryable error
-                        Consumer->>Kafka: Re-send job to topic (reschedule)
-                    else Handler returns non-retryable error
-                        Consumer->>Consumer: Log error, move on
-                    else Handler returns nil
-                        Consumer->>Consumer: Success, move on
-                    end
-                end
-            end
-        end
+        Note over Consumer: Process partitions in parallel,<br/>records within partition sequentially
+
+        Consumer->>Consumer: Unmarshal record
+        Consumer->>Kafka: Commit offset
+        Consumer->>Handler: Process job
     end
-
-    Consumer->>Consumer: Wait for all partitions to finish
-    Consumer->>Kafka: PollFetches(ctx) (next batch)
 ```
 
 ### Parallelism
@@ -234,36 +215,6 @@ All metrics are defined in the `otel` package and recorded via function calls (n
 | `keepie.consumer.offset_commit_errors` | Counter | Offset commits that failed |
 | `keepie.jobs.processing_duration_seconds` | Histogram | Time spent in the handler |
 | `keepie.jobs.time_in_queue_seconds` | Histogram | Time between creation/rescheduling and consumption |
-
-### HTTP metrics
-
-| Metric | Type | Description |
-|---|---|---|
-| `keepie.http.requests` | Counter | Number of HTTP handler executions |
-| `keepie.http.invalid_bodies` | Counter | Requests with invalid or unparseable bodies |
-| `keepie.http.duration_seconds` | Histogram | Duration of HTTP handler execution |
-
----
-
-## HTTP API
-
-The `api` package exposes an HTTP handler for scheduling jobs. The handler depends on a `JobScheduler` interface (implemented by `kafka.Producer`).
-
-### `POST /jobs`
-
-**Request:**
-```json
-{"webhook_url": "https://example.com/callback"}
-```
-
-**Response (202 Accepted):**
-```json
-{"job_id": "550e8400-e29b-41d4-a716-446655440000"}
-```
-
-**Errors:**
-- `400 Bad Request` — invalid JSON, empty webhook URL, or invalid URL
-- `500 Internal Server Error` — scheduler failed to send the job
 
 ---
 
