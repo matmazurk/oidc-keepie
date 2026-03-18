@@ -75,7 +75,7 @@ func TestProduceAndConsume(t *testing.T) {
 	}
 
 	received := make(chan job.Job, 1)
-	consumer, err := kfk.NewConsumer(brokers, "test-group-produce-consume", func(ctx context.Context, j job.Job) error {
+	consumer, err := kfk.NewConsumer(brokers, "test-group-produce-consume", producer, func(ctx context.Context, j job.Job) error {
 		received <- j
 		return nil
 	})
@@ -149,11 +149,11 @@ func TestWorkloadDistribution(t *testing.T) {
 
 	groupID := fmt.Sprintf("test-group-workload-%d", time.Now().UnixNano())
 
-	consumer1, err := kfk.NewConsumer(brokers, groupID, makeHandler("consumer-1"))
+	consumer1, err := kfk.NewConsumer(brokers, groupID, producer, makeHandler("consumer-1"))
 	if err != nil {
 		t.Fatalf("creating consumer 1: %v", err)
 	}
-	consumer2, err := kfk.NewConsumer(brokers, groupID, makeHandler("consumer-2"))
+	consumer2, err := kfk.NewConsumer(brokers, groupID, producer, makeHandler("consumer-2"))
 	if err != nil {
 		t.Fatalf("creating consumer 2: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestConsumerRebalancing(t *testing.T) {
 	consumer1Received := make(chan string, 100)
 	consumer2Received := make(chan string, 100)
 
-	consumer1, err := kfk.NewConsumer(brokers, groupID, func(ctx context.Context, j job.Job) error {
+	consumer1, err := kfk.NewConsumer(brokers, groupID, producer, func(ctx context.Context, j job.Job) error {
 		mu.Lock()
 		consumer1Messages = append(consumer1Messages, j.ID())
 		mu.Unlock()
@@ -267,7 +267,7 @@ func TestConsumerRebalancing(t *testing.T) {
 		t.Fatalf("creating consumer 1: %v", err)
 	}
 
-	consumer2, err := kfk.NewConsumer(brokers, groupID, func(ctx context.Context, j job.Job) error {
+	consumer2, err := kfk.NewConsumer(brokers, groupID, producer, func(ctx context.Context, j job.Job) error {
 		mu.Lock()
 		consumer2Messages = append(consumer2Messages, j.ID())
 		mu.Unlock()
@@ -381,7 +381,7 @@ func TestOffsetPersistence(t *testing.T) {
 
 	// consume all 3 messages with first consumer
 	received1 := make(chan string, 10)
-	consumer1, err := kfk.NewConsumer(brokers, groupID, func(ctx context.Context, j job.Job) error {
+	consumer1, err := kfk.NewConsumer(brokers, groupID, producer, func(ctx context.Context, j job.Job) error {
 		received1 <- j.ID()
 		return nil
 	})
@@ -421,7 +421,7 @@ func TestOffsetPersistence(t *testing.T) {
 
 	// start a new consumer in the same group — should only get the 2 new messages
 	received2 := make(chan string, 10)
-	consumer2, err := kfk.NewConsumer(brokers, groupID, func(ctx context.Context, j job.Job) error {
+	consumer2, err := kfk.NewConsumer(brokers, groupID, producer, func(ctx context.Context, j job.Job) error {
 		received2 <- j.ID()
 		return nil
 	})

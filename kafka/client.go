@@ -51,11 +51,12 @@ func (p *Producer) Close() error {
 type Handler func(ctx context.Context, j job.Job) error
 
 type Consumer struct {
-	group   sarama.ConsumerGroup
-	handler Handler
+	group    sarama.ConsumerGroup
+	producer *Producer
+	handler  Handler
 }
 
-func NewConsumer(brokers []string, groupID string, handler Handler) (*Consumer, error) {
+func NewConsumer(brokers []string, groupID string, producer *Producer, handler Handler) (*Consumer, error) {
 	cfg := sarama.NewConfig()
 	cfg.Consumer.Offsets.Initial = sarama.OffsetOldest
 	cfg.Consumer.Offsets.AutoCommit.Enable = false
@@ -66,14 +67,17 @@ func NewConsumer(brokers []string, groupID string, handler Handler) (*Consumer, 
 	}
 
 	return &Consumer{
-		group:   group,
-		handler: handler,
+		group:    group,
+		producer: producer,
+		handler:  handler,
 	}, nil
 }
 
 func (c *Consumer) Start(ctx context.Context, topic string) error {
 	gh := &groupHandler{
-		handler: c.handler,
+		handler:  c.handler,
+		producer: c.producer,
+		topic:    topic,
 	}
 
 	for {
@@ -92,7 +96,9 @@ func (c *Consumer) Close() error {
 }
 
 type groupHandler struct {
-	handler Handler
+	handler  Handler
+	producer *Producer
+	topic    string
 }
 
 func (h *groupHandler) Setup(_ sarama.ConsumerGroupSession) error {
@@ -110,18 +116,25 @@ func (h *groupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim s
 
 		var kj kafkaJob
 		if err := json.Unmarshal(msg.Value, &kj); err != nil {
-			slog.Error("unmarshaling message", "error", err)
+			slog.Error("unmarshaling message", slog.String("error", err.Error()))
 			continue
 		}
 
 		j, err := kj.toJob()
 		if err != nil {
-			slog.Error("converting kafka job to domain job", "error", err)
+			slog.Error("converting kafka job to domain job", slog.String("error", err.Error()))
 			continue
 		}
 
 		if err := h.handler(session.Context(), j); err != nil {
-			slog.Error("handling job", "job_id", j.ID(), "error", err)
+			if job.IsRetryable(err) {
+				slog.Info("rescheduling retryable job", slog.String("job_id", j.ID()), slog.String("error", err.Error()))
+				if sendErr := h.producer.Send(session.Context(), h.topic, j); sendErr != nil {
+					slog.Error("rescheduling job", slog.String("job_id", j.ID()), slog.String("error", sendErr.Error()))
+				}
+				continue
+			}
+			slog.Error("handling job", slog.String("job_id", j.ID()), slog.String("error", err.Error()))
 		}
 	}
 	return nil
