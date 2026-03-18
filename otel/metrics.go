@@ -11,13 +11,17 @@ import (
 var (
 	instrumentsOnce sync.Once
 
-	jobsProduced       metric.Int64Counter
+	jobsScheduled       metric.Int64Counter
 	jobsConsumed       metric.Int64Counter
 	jobsProcessed      metric.Int64Counter
 	jobsFailed         metric.Int64Counter
 	jobsRescheduled    metric.Int64Counter
 	unmarshalErrors    metric.Int64Counter
 	offsetCommitErrors metric.Int64Counter
+
+	httpRequests      metric.Int64Counter
+	httpInvalidBodies metric.Int64Counter
+	httpDuration      metric.Float64Histogram
 
 	processingDuration metric.Float64Histogram
 	timeInQueue        metric.Float64Histogram
@@ -27,7 +31,7 @@ func initInstruments() {
 	instrumentsOnce.Do(func() {
 		m := Meter()
 
-		jobsProduced, _ = m.Int64Counter("keepie.jobs.produced",
+		jobsScheduled, _ = m.Int64Counter("keepie.jobs.scheduled",
 			metric.WithDescription("Number of jobs sent to Kafka"),
 		)
 		jobsConsumed, _ = m.Int64Counter("keepie.jobs.consumed",
@@ -49,6 +53,17 @@ func initInstruments() {
 			metric.WithDescription("Number of offset commits that failed"),
 		)
 
+		httpRequests, _ = m.Int64Counter("keepie.http.requests",
+			metric.WithDescription("Number of HTTP handler executions"),
+		)
+		httpInvalidBodies, _ = m.Int64Counter("keepie.http.invalid_bodies",
+			metric.WithDescription("Number of HTTP requests with invalid request bodies"),
+		)
+		httpDuration, _ = m.Float64Histogram("keepie.http.duration_seconds",
+			metric.WithDescription("Duration of HTTP handler execution"),
+			metric.WithUnit("s"),
+		)
+
 		processingDuration, _ = m.Float64Histogram("keepie.jobs.processing_duration_seconds",
 			metric.WithDescription("Time spent processing a job in the handler"),
 			metric.WithUnit("s"),
@@ -60,9 +75,9 @@ func initInstruments() {
 	})
 }
 
-func JobProduced(ctx context.Context) {
+func JobScheduled(ctx context.Context) {
 	initInstruments()
-	jobsProduced.Add(ctx, 1)
+	jobsScheduled.Add(ctx, 1)
 }
 
 func JobConsumed(ctx context.Context) {
@@ -104,3 +119,19 @@ func RecordTimeInQueue(ctx context.Context, d time.Duration) {
 	initInstruments()
 	timeInQueue.Record(ctx, d.Seconds())
 }
+
+func HTTPRequest(ctx context.Context) {
+	initInstruments()
+	httpRequests.Add(ctx, 1)
+}
+
+func HTTPInvalidBody(ctx context.Context) {
+	initInstruments()
+	httpInvalidBodies.Add(ctx, 1)
+}
+
+func RecordHTTPDuration(ctx context.Context, d time.Duration) {
+	initInstruments()
+	httpDuration.Record(ctx, d.Seconds())
+}
+
