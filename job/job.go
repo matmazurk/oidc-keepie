@@ -37,6 +37,14 @@ func New(id, jobID, webhookURL string, createdAt time.Time) (Job, error) {
 	}, nil
 }
 
+func MustNew(id, jobID, webhookURL string, createdAt time.Time) Job {
+	j, err := New(id, jobID, webhookURL, createdAt)
+	if err != nil {
+		panic(err)
+	}
+	return j
+}
+
 func (j Job) ID() string {
 	return j.id
 }

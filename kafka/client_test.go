@@ -65,10 +65,7 @@ func TestProduceAndConsume(t *testing.T) {
 	defer producer.Close()
 
 	now := time.Now().Truncate(time.Second)
-	j, err := job.New("evt-1", "job-1", "https://example.com/webhook", now)
-	if err != nil {
-		t.Fatalf("creating job: %v", err)
-	}
+	j := job.MustNew("evt-1", "job-1", "https://example.com/webhook", now)
 
 	if err := producer.Send(context.Background(), topic, j); err != nil {
 		t.Fatalf("sending message: %v", err)
@@ -176,15 +173,12 @@ func TestWorkloadDistribution(t *testing.T) {
 	time.Sleep(5 * time.Second)
 
 	for i := range messageCount {
-		j, err := job.New(
+		j := job.MustNew(
 			fmt.Sprintf("evt-%d", i),
 			fmt.Sprintf("job-%d", i),
 			"https://example.com/webhook",
 			now,
 		)
-		if err != nil {
-			t.Fatalf("creating job %d: %v", i, err)
-		}
 		if err := producer.Send(ctx, topic, j); err != nil {
 			t.Fatalf("sending message %d: %v", i, err)
 		}
@@ -298,7 +292,7 @@ func TestConsumerRebalancing(t *testing.T) {
 
 	// send messages while both consumers are active
 	for i := range 5 {
-		j, _ := job.New(fmt.Sprintf("evt-phase1-%d", i), fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
+		j := job.MustNew(fmt.Sprintf("evt-phase1-%d", i), fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
 		if err := producer.Send(context.Background(), topic, j); err != nil {
 			t.Fatalf("sending phase 1 message %d: %v", i, err)
 		}
@@ -327,7 +321,7 @@ func TestConsumerRebalancing(t *testing.T) {
 
 	// send more messages — consumer 2 should get all of them
 	for i := range 5 {
-		j, _ := job.New(fmt.Sprintf("evt-phase2-%d", i), fmt.Sprintf("job-phase2-%d", i), "https://example.com/webhook", now)
+		j := job.MustNew(fmt.Sprintf("evt-phase2-%d", i), fmt.Sprintf("job-phase2-%d", i), "https://example.com/webhook", now)
 		if err := producer.Send(context.Background(), topic, j); err != nil {
 			t.Fatalf("sending phase 2 message %d: %v", i, err)
 		}
@@ -373,7 +367,7 @@ func TestOffsetPersistence(t *testing.T) {
 
 	// send 3 messages
 	for i := range 3 {
-		j, _ := job.New(fmt.Sprintf("evt-%d", i), fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
+		j := job.MustNew(fmt.Sprintf("evt-%d", i), fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
 		if err := producer.Send(context.Background(), topic, j); err != nil {
 			t.Fatalf("sending message %d: %v", i, err)
 		}
@@ -413,7 +407,7 @@ func TestOffsetPersistence(t *testing.T) {
 
 	// send 2 more messages
 	for i := 3; i < 5; i++ {
-		j, _ := job.New(fmt.Sprintf("evt-%d", i), fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
+		j := job.MustNew(fmt.Sprintf("evt-%d", i), fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
 		if err := producer.Send(context.Background(), topic, j); err != nil {
 			t.Fatalf("sending message %d: %v", i, err)
 		}
@@ -510,7 +504,7 @@ func TestRetryableError(t *testing.T) {
 		}
 	}()
 
-	j, _ := job.New("evt-1", "job-1", "https://example.com/webhook", now)
+	j := job.MustNew("evt-1", "job-1", "https://example.com/webhook", now)
 	if err := producer.Send(ctx, topic, j); err != nil {
 		t.Fatalf("sending message: %v", err)
 	}
