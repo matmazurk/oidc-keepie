@@ -64,10 +64,12 @@ func TestProduceAndConsume(t *testing.T) {
 	}
 	defer producer.Close()
 
+	ctx := t.Context()
+
 	now := time.Now().Truncate(time.Second)
 	j := job.MustNew("evt-1", "job-1", "https://example.com/webhook", now)
 
-	if err := producer.Send(context.Background(), topic, j); err != nil {
+	if err := producer.Send(ctx, topic, j); err != nil {
 		t.Fatalf("sending message: %v", err)
 	}
 
@@ -79,9 +81,7 @@ func TestProduceAndConsume(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating consumer: %v", err)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	defer consumer.Close()
 
 	go func() {
 		if err := consumer.Start(ctx, topic); err != nil {
@@ -106,9 +106,6 @@ func TestProduceAndConsume(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for message")
 	}
-
-	cancel()
-	consumer.Close()
 }
 
 func TestWorkloadDistribution(t *testing.T) {
@@ -121,7 +118,9 @@ func TestWorkloadDistribution(t *testing.T) {
 	}
 	defer producer.Close()
 
-	messageCount := 20
+	ctx := t.Context()
+
+	messageCount := 200
 	now := time.Now().Truncate(time.Second)
 
 	var mu sync.Mutex
@@ -150,13 +149,12 @@ func TestWorkloadDistribution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating consumer 1: %v", err)
 	}
+	defer consumer1.Close()
 	consumer2, err := kfk.NewConsumer(brokers, groupID, producer, makeHandler("consumer-2"))
 	if err != nil {
 		t.Fatalf("creating consumer 2: %v", err)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	defer consumer2.Close()
 
 	go func() {
 		if err := consumer1.Start(ctx, topic); err != nil {
@@ -189,10 +187,6 @@ func TestWorkloadDistribution(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for all messages")
 	}
-
-	cancel()
-	consumer1.Close()
-	consumer2.Close()
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -240,6 +234,8 @@ func TestConsumerRebalancing(t *testing.T) {
 	}
 	defer producer.Close()
 
+	ctx := t.Context()
+
 	now := time.Now().Truncate(time.Second)
 	groupID := fmt.Sprintf("test-group-rebalance-%d", time.Now().UnixNano())
 
@@ -271,10 +267,10 @@ func TestConsumerRebalancing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating consumer 2: %v", err)
 	}
+	defer consumer2.Close()
 
-	ctx1, cancel1 := context.WithCancel(context.Background())
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel2()
+	// consumer 1 gets its own context so we can stop it mid-test
+	ctx1, cancel1 := context.WithCancel(ctx)
 
 	go func() {
 		if err := consumer1.Start(ctx1, topic); err != nil {
@@ -282,7 +278,7 @@ func TestConsumerRebalancing(t *testing.T) {
 		}
 	}()
 	go func() {
-		if err := consumer2.Start(ctx2, topic); err != nil {
+		if err := consumer2.Start(ctx, topic); err != nil {
 			t.Logf("consumer 2 stopped: %v", err)
 		}
 	}()
@@ -293,21 +289,20 @@ func TestConsumerRebalancing(t *testing.T) {
 	// send messages while both consumers are active
 	for i := range 5 {
 		j := job.MustNew(fmt.Sprintf("evt-phase1-%d", i), fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
-		if err := producer.Send(context.Background(), topic, j); err != nil {
+		if err := producer.Send(ctx, topic, j); err != nil {
 			t.Fatalf("sending phase 1 message %d: %v", i, err)
 		}
 	}
 
 	// wait for phase 1 messages to be consumed
 	phase1Count := 0
-	timeout := time.After(30 * time.Second)
 	for phase1Count < 5 {
 		select {
 		case <-consumer1Received:
 			phase1Count++
 		case <-consumer2Received:
 			phase1Count++
-		case <-timeout:
+		case <-ctx.Done():
 			t.Fatal("timed out waiting for phase 1 messages")
 		}
 	}
@@ -322,24 +317,20 @@ func TestConsumerRebalancing(t *testing.T) {
 	// send more messages — consumer 2 should get all of them
 	for i := range 5 {
 		j := job.MustNew(fmt.Sprintf("evt-phase2-%d", i), fmt.Sprintf("job-phase2-%d", i), "https://example.com/webhook", now)
-		if err := producer.Send(context.Background(), topic, j); err != nil {
+		if err := producer.Send(ctx, topic, j); err != nil {
 			t.Fatalf("sending phase 2 message %d: %v", i, err)
 		}
 	}
 
 	phase2Count := 0
-	timeout = time.After(30 * time.Second)
 	for phase2Count < 5 {
 		select {
 		case <-consumer2Received:
 			phase2Count++
-		case <-timeout:
+		case <-ctx.Done():
 			t.Fatal("timed out waiting for phase 2 messages")
 		}
 	}
-
-	cancel2()
-	consumer2.Close()
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -363,12 +354,14 @@ func TestOffsetPersistence(t *testing.T) {
 	}
 	defer producer.Close()
 
+	ctx := t.Context()
+
 	now := time.Now().Truncate(time.Second)
 
 	// send 3 messages
 	for i := range 3 {
 		j := job.MustNew(fmt.Sprintf("evt-%d", i), fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
-		if err := producer.Send(context.Background(), topic, j); err != nil {
+		if err := producer.Send(ctx, topic, j); err != nil {
 			t.Fatalf("sending message %d: %v", i, err)
 		}
 	}
@@ -383,7 +376,7 @@ func TestOffsetPersistence(t *testing.T) {
 		t.Fatalf("creating consumer 1: %v", err)
 	}
 
-	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx1, cancel1 := context.WithCancel(ctx)
 
 	go func() {
 		if err := consumer1.Start(ctx1, topic); err != nil {
@@ -396,7 +389,7 @@ func TestOffsetPersistence(t *testing.T) {
 		select {
 		case <-received1:
 			count++
-		case <-ctx1.Done():
+		case <-ctx.Done():
 			t.Fatal("timed out waiting for first consumer to receive messages")
 		}
 	}
@@ -408,7 +401,7 @@ func TestOffsetPersistence(t *testing.T) {
 	// send 2 more messages
 	for i := 3; i < 5; i++ {
 		j := job.MustNew(fmt.Sprintf("evt-%d", i), fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
-		if err := producer.Send(context.Background(), topic, j); err != nil {
+		if err := producer.Send(ctx, topic, j); err != nil {
 			t.Fatalf("sending message %d: %v", i, err)
 		}
 	}
@@ -422,12 +415,10 @@ func TestOffsetPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating consumer 2: %v", err)
 	}
-
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel2()
+	defer consumer2.Close()
 
 	go func() {
-		if err := consumer2.Start(ctx2, topic); err != nil {
+		if err := consumer2.Start(ctx, topic); err != nil {
 			t.Logf("consumer 2 stopped: %v", err)
 		}
 	}()
@@ -439,7 +430,7 @@ func TestOffsetPersistence(t *testing.T) {
 		case id := <-received2:
 			newMessages = append(newMessages, id)
 			count++
-		case <-ctx2.Done():
+		case <-ctx.Done():
 			t.Fatal("timed out waiting for second consumer to receive messages")
 		}
 	}
@@ -451,9 +442,6 @@ func TestOffsetPersistence(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		// good — no more messages
 	}
-
-	cancel2()
-	consumer2.Close()
 
 	if len(newMessages) != 2 {
 		t.Errorf("expected 2 messages, got %d", len(newMessages))
@@ -471,6 +459,8 @@ func TestRetryableError(t *testing.T) {
 		t.Fatalf("creating producer: %v", err)
 	}
 	defer producer.Close()
+
+	ctx := t.Context()
 
 	now := time.Now().Truncate(time.Second)
 
@@ -494,9 +484,7 @@ func TestRetryableError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating consumer: %v", err)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	defer consumer.Close()
 
 	go func() {
 		if err := consumer.Start(ctx, topic); err != nil {
@@ -514,9 +502,6 @@ func TestRetryableError(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for retried message")
 	}
-
-	cancel()
-	consumer.Close()
 
 	mu.Lock()
 	defer mu.Unlock()
