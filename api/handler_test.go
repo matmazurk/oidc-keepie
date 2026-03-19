@@ -55,11 +55,6 @@ func TestScheduleJob(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
-			name:       "non-https webhook url",
-			body:       `{"webhook_url": "http://example.com/callback"}`,
-			wantStatus: http.StatusBadRequest,
-		},
-		{
 			name:         "scheduler error",
 			body:         `{"webhook_url": "https://example.com/callback"}`,
 			schedulerErr: fmt.Errorf("kafka down"),

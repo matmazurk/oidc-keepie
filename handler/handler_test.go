@@ -68,12 +68,12 @@ func TestHandler(t *testing.T) {
 			var client *http.Client
 
 			if tt.serverFunc != nil {
-				server := httptest.NewTLSServer(http.HandlerFunc(tt.serverFunc))
+				server := httptest.NewServer(http.HandlerFunc(tt.serverFunc))
 				defer server.Close()
 				webhookURL = server.URL
-				client = server.Client()
+				client = http.DefaultClient
 			} else {
-				webhookURL = "https://example.com"
+				webhookURL = "http://example.com"
 				client = http.DefaultClient
 			}
 
@@ -102,7 +102,7 @@ func TestHandlerSendsTokenAsBody(t *testing.T) {
 	token := []byte("my-jwt-token-data")
 	var receivedBody []byte
 
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var buf [1024]byte
 		n, _ := r.Body.Read(buf[:])
 		receivedBody = buf[:n]
@@ -111,7 +111,7 @@ func TestHandlerSendsTokenAsBody(t *testing.T) {
 	defer server.Close()
 
 	j := job.MustNew("job-1", server.URL, time.Now())
-	handle := handler.New(&mockIssuer{token: token}, server.Client())
+	handle := handler.New(&mockIssuer{token: token}, http.DefaultClient)
 
 	if err := handle(context.Background(), j); err != nil {
 		t.Fatalf("unexpected error: %v", err)

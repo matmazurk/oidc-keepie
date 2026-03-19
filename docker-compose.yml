@@ -1,0 +1,97 @@
+services:
+  kafka-init:
+    image: confluentinc/confluent-local:7.5.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      kafka-topics --bootstrap-server kafka:9092
+      --create --if-not-exists
+      --topic keepie-jobs
+      --partitions 2
+      --replication-factor 1
+
+  keepie:
+    build: .
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: keepie-jobs
+      KAFKA_GROUP_ID: keepie
+      HTTP_PORT: "8080"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    ports:
+      - "8080:8080"
+    labels:
+      logging: "true"
+
+  kafka:
+    image: confluentinc/confluent-local:7.5.0
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.123.0
+    volumes:
+      - ./deploy/otel-collector.yml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  tempo:
+    image: grafana/tempo:2.7.2
+    volumes:
+      - ./deploy/tempo.yml:/etc/tempo/config.yaml:ro
+    command: ["-config.file=/etc/tempo/config.yaml"]
+    ports:
+      - "3200:3200"
+
+  loki:
+    image: grafana/loki:3.4.3
+    volumes:
+      - ./deploy/loki.yml:/etc/loki/config.yaml:ro
+    command: ["-config.file=/etc/loki/config.yaml"]
+    ports:
+      - "3100:3100"
+
+  alloy:
+    image: grafana/alloy:v1.8.3
+    volumes:
+      - ./deploy/alloy.yml:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./deploy/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    ports:
+      - "3000:3000"
