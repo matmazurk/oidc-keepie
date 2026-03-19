@@ -38,7 +38,8 @@ type scheduleResponse struct {
 
 func (h *Handler) scheduleJob(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	ctx := r.Context()
+	ctx, span := keepieotel.Tracer().Start(r.Context(), "http.schedule_job")
+	defer span.End()
 	keepieotel.HTTPRequest(ctx)
 
 	var req scheduleRequest

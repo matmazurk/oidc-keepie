@@ -30,8 +30,12 @@ func NewProducer(brokers []string, topic string) (*Producer, error) {
 }
 
 func (p *Producer) Send(ctx context.Context, j job.Job) error {
+	ctx, span := keepieotel.Tracer().Start(ctx, "kafka.produce")
+	defer span.End()
+
 	data, err := json.Marshal(toKafkaJob(j))
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("marshaling job: %w", err)
 	}
 
@@ -42,6 +46,7 @@ func (p *Producer) Send(ctx context.Context, j job.Job) error {
 
 	results := p.client.ProduceSync(ctx, record)
 	if err := results.FirstErr(); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("sending message: %w", err)
 	}
 	keepieotel.JobScheduled(ctx)
@@ -104,6 +109,9 @@ func (c *Consumer) Start(ctx context.Context) error {
 }
 
 func (c *Consumer) processRecord(ctx context.Context, record *kgo.Record) {
+	ctx, span := keepieotel.Tracer().Start(ctx, "kafka.process")
+	defer span.End()
+
 	slog.Debug("received record",
 		slog.Int("partition", int(record.Partition)),
 		slog.Int64("offset", record.Offset),
