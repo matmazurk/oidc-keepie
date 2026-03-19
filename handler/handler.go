@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/matmazurk/oidc-keepie/job"
@@ -37,6 +38,7 @@ func New(issuer TokenIssuer, client *http.Client) func(context.Context, job.Job)
 			return fmt.Errorf("sending webhook: %w", err)
 		}
 		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
 
 		if resp.StatusCode >= 400 {
 			err := fmt.Errorf("webhook returned status %d", resp.StatusCode)

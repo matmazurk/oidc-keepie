@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/matmazurk/oidc-keepie/api"
 	"github.com/matmazurk/oidc-keepie/handler"
@@ -43,7 +44,14 @@ func main() {
 	}
 	defer producer.Close()
 
-	handle := handler.New(&stubIssuer{}, &http.Client{})
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        1000,
+			MaxIdleConnsPerHost: 1000,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+	handle := handler.New(&stubIssuer{}, httpClient)
 
 	consumer, err := kafka.NewConsumer(cfg.brokers, cfg.groupID, cfg.topic, producer, handle)
 	if err != nil {
