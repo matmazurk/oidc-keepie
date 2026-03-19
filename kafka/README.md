@@ -8,7 +8,7 @@ Uses [franz-go](https://github.com/twmb/franz-go) (`kgo`) for both producing and
 |---|---|---|
 | Library | `twmb/franz-go` | Synchronous `CommitRecords` returns error, unlike sarama's fire-and-forget |
 | Partitions | 2 | Allows scaling up to 2 consumer instances |
-| Offset commit | Manual, after unmarshal | Commit after successful unmarshal to prevent duplicate JWTs while allowing redelivery on unmarshal crash |
+| Offset commit | Manual, commit-first | Commit before processing to prevent duplicate JWTs |
 | Partitioning | Round-robin (no key) | Jobs are independent, we want even distribution |
 | Auto-offset-reset | `earliest` | On first start or expired offsets, process from beginning rather than skip |
 
@@ -49,8 +49,8 @@ sequenceDiagram
         Kafka-->>Consumer: Batch of records
 
         loop Each record (sequential)
-            Consumer->>Consumer: Unmarshal record
             Consumer->>Kafka: Commit offset
+            Consumer->>Consumer: Unmarshal record
             Consumer->>Handler: Process job
         end
     end
@@ -70,11 +70,7 @@ Maximum useful consumer instances = number of partitions. Extra instances sit id
 
 ## Commit strategy and failure points
 
-We commit the offset **after unmarshal but before processing** the job. This is a deliberate design choice:
-
-- **Unmarshal before commit:** If the instance crashes during unmarshal, the offset hasn't been committed, so the message will be redelivered. This is safe because unmarshal is a pure operation.
-- **Commit before handler:** Once committed, the job won't be redelivered. This prevents duplicate JWTs since our job (generating a JWT and sending it to a webhook) is **not idempotent**.
-- **Bad messages:** If unmarshal fails (corrupt data), we commit the offset anyway to avoid infinite redelivery loops. The error is logged and a metric is recorded.
+We commit the offset **before** processing the job. This is a deliberate design choice driven by the fact that our job (generating a JWT and sending it to a webhook) is **not idempotent** — sending two different JWTs for the same request is worse than losing a single job.
 
 With franz-go, `CommitRecords` is synchronous and returns an error. If the commit fails, we skip the record entirely — it will be redelivered on the next poll.
 
@@ -82,9 +78,9 @@ With franz-go, `CommitRecords` is synchronous and returns an error. If the commi
 
 ```mermaid
 graph TD
-    A[Receive record] --> B[Unmarshal JSON]
-    B -->|error| B1[Log + metric, commit to skip]
-    B -->|success| C[CommitRecords]
+    A[Receive record] --> B[CommitRecords]
+    B -->|error| B1[Log + metric, skip]
+    B -->|success| C[Unmarshal JSON]
     C -->|error| C1[Log + metric, skip]
     C -->|success| D[Call handler]
     D --> E{Handler result?}
@@ -92,7 +88,7 @@ graph TD
     E -->|retryable error| G[Re-send to topic]
     E -->|non-retryable error| H[Log error]
 
-    style C fill:#ff9999,stroke:#cc0000
+    style B fill:#ff9999,stroke:#cc0000
     style D fill:#ff9999,stroke:#cc0000
 ```
 
@@ -102,8 +98,6 @@ graph TD
 
 | Failure point | What happens | Job lost? |
 |---|---|---|
-| Unmarshal fails (corrupt data) | Offset committed to skip bad message. Original job data was invalid. | N/A (not a valid job) |
-| Crash during unmarshal | Offset not yet committed, message will be redelivered. | No |
 | Commit fails | Record skipped, will be redelivered on next poll. | No |
 | **After commit, before handler starts** | **Offset committed, handler never ran.** | **YES** |
 | **During handler execution (before webhook)** | **Offset committed, JWT never sent.** | **YES** |
@@ -131,8 +125,8 @@ sequenceDiagram
     participant Handler
 
     Kafka->>Consumer: Message (job-1, retryCount=0)
-    Consumer->>Consumer: Unmarshal (success)
     Consumer->>Kafka: CommitRecords (success)
+    Consumer->>Consumer: Unmarshal (success)
     Consumer->>Handler: handler(ctx, job)
     Handler-->>Consumer: RetryableError("webhook timeout")
     Consumer->>Consumer: job.Reschedule(now)
@@ -140,8 +134,8 @@ sequenceDiagram
     Note over Kafka: Job re-enters the topic<br/>with new event ID
 
     Kafka->>Consumer: Message (job-1, retryCount=1)
-    Consumer->>Consumer: Unmarshal (success)
     Consumer->>Kafka: CommitRecords (success)
+    Consumer->>Consumer: Unmarshal (success)
     Consumer->>Handler: handler(ctx, job)
     Handler-->>Consumer: nil (success)
 ```

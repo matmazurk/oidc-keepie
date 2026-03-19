@@ -111,18 +111,20 @@ func (c *Consumer) processRecord(ctx context.Context, record *kgo.Record) {
 
 	received := time.Now()
 
+	if err := c.client.CommitRecords(ctx, record); err != nil {
+		slog.Error("committing offset",
+			slog.String("error", err.Error()),
+			slog.Int("partition", int(record.Partition)),
+			slog.Int64("offset", record.Offset),
+		)
+		keepieotel.OffsetCommitError(ctx)
+		return
+	}
+
 	var kj kafkaJob
 	if err := json.Unmarshal(record.Value, &kj); err != nil {
 		slog.Error("unmarshaling message", slog.String("error", err.Error()))
 		keepieotel.UnmarshalError(ctx)
-		if commitErr := c.client.CommitRecords(ctx, record); commitErr != nil {
-			slog.Error("committing offset for invalid message",
-				slog.String("error", commitErr.Error()),
-				slog.Int("partition", int(record.Partition)),
-				slog.Int64("offset", record.Offset),
-			)
-			keepieotel.OffsetCommitError(ctx)
-		}
 		return
 	}
 
@@ -130,25 +132,6 @@ func (c *Consumer) processRecord(ctx context.Context, record *kgo.Record) {
 	if err != nil {
 		slog.Error("converting kafka job to domain job", slog.String("error", err.Error()))
 		keepieotel.UnmarshalError(ctx)
-		if commitErr := c.client.CommitRecords(ctx, record); commitErr != nil {
-			slog.Error("committing offset for unconvertible message",
-				slog.String("error", commitErr.Error()),
-				slog.Int("partition", int(record.Partition)),
-				slog.Int64("offset", record.Offset),
-			)
-			keepieotel.OffsetCommitError(ctx)
-		}
-		return
-	}
-
-	if err := c.client.CommitRecords(ctx, record); err != nil {
-		slog.Error("committing offset",
-			slog.String("error", err.Error()),
-			slog.Any("job", j),
-			slog.Int("partition", int(record.Partition)),
-			slog.Int64("offset", record.Offset),
-		)
-		keepieotel.OffsetCommitError(ctx)
 		return
 	}
 
