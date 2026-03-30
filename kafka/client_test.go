@@ -11,6 +11,7 @@ import (
 
 	"github.com/matmazurk/oidc-keepie/job"
 	kfk "github.com/matmazurk/oidc-keepie/kafka"
+	"github.com/matmazurk/oidc-keepie/pool"
 	tc "github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/kafka"
 	"github.com/twmb/franz-go/pkg/kadm"
@@ -72,10 +73,12 @@ func TestProduceAndConsume(t *testing.T) {
 	}
 
 	received := make(chan job.Job, 1)
-	consumer, err := kfk.NewConsumer(brokers, "test-group-produce-consume", topic, producer, func(ctx context.Context, j job.Job) error {
+	p := pool.New(2, func(ctx context.Context, j job.Job) {
 		received <- j
-		return nil
 	})
+	defer p.Close()
+
+	consumer, err := kfk.NewConsumer(brokers, "test-group-produce-consume", topic, p)
 	if err != nil {
 		t.Fatalf("creating consumer: %v", err)
 	}
@@ -131,8 +134,8 @@ func TestWorkloadDistribution(t *testing.T) {
 	}
 	allReceived := make(chan struct{})
 
-	makeHandler := func(name string) kfk.Handler {
-		return func(ctx context.Context, j job.Job) error {
+	makeHandler := func(name string) func(context.Context, job.Job) {
+		return func(ctx context.Context, j job.Job) {
 			mu.Lock()
 			defer mu.Unlock()
 			receivedByConsumer[name] = append(receivedByConsumer[name], j.JobID())
@@ -140,18 +143,22 @@ func TestWorkloadDistribution(t *testing.T) {
 			if total == messageCount {
 				close(allReceived)
 			}
-			return nil
 		}
 	}
 
 	groupID := fmt.Sprintf("test-group-workload-%d", time.Now().UnixNano())
 
-	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, producer, makeHandler("consumer-1"))
+	p1 := pool.New(2, makeHandler("consumer-1"))
+	defer p1.Close()
+	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1)
 	if err != nil {
 		t.Fatalf("creating consumer 1: %v", err)
 	}
 	defer consumer1.Close()
-	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, producer, makeHandler("consumer-2"))
+
+	p2 := pool.New(2, makeHandler("consumer-2"))
+	defer p2.Close()
+	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2)
 	if err != nil {
 		t.Fatalf("creating consumer 2: %v", err)
 	}
@@ -246,24 +253,28 @@ func TestConsumerRebalancing(t *testing.T) {
 	consumer1Received := make(chan string, 100)
 	consumer2Received := make(chan string, 100)
 
-	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, producer, func(ctx context.Context, j job.Job) error {
+	p1 := pool.New(2, func(ctx context.Context, j job.Job) {
 		mu.Lock()
 		consumer1Messages = append(consumer1Messages, j.JobID())
 		mu.Unlock()
 		consumer1Received <- j.JobID()
-		return nil
 	})
+	defer p1.Close()
+
+	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1)
 	if err != nil {
 		t.Fatalf("creating consumer 1: %v", err)
 	}
 
-	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, producer, func(ctx context.Context, j job.Job) error {
+	p2 := pool.New(2, func(ctx context.Context, j job.Job) {
 		mu.Lock()
 		consumer2Messages = append(consumer2Messages, j.JobID())
 		mu.Unlock()
 		consumer2Received <- j.JobID()
-		return nil
 	})
+	defer p2.Close()
+
+	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2)
 	if err != nil {
 		t.Fatalf("creating consumer 2: %v", err)
 	}
@@ -368,10 +379,12 @@ func TestOffsetPersistence(t *testing.T) {
 
 	// consume all 3 messages with first consumer
 	received1 := make(chan string, 10)
-	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, producer, func(ctx context.Context, j job.Job) error {
+	p1 := pool.New(2, func(ctx context.Context, j job.Job) {
 		received1 <- j.JobID()
-		return nil
 	})
+	defer p1.Close()
+
+	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1)
 	if err != nil {
 		t.Fatalf("creating consumer 1: %v", err)
 	}
@@ -408,10 +421,12 @@ func TestOffsetPersistence(t *testing.T) {
 
 	// start a new consumer in the same group — should only get the 2 new messages
 	received2 := make(chan string, 10)
-	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, producer, func(ctx context.Context, j job.Job) error {
+	p2 := pool.New(2, func(ctx context.Context, j job.Job) {
 		received2 <- j.JobID()
-		return nil
 	})
+	defer p2.Close()
+
+	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2)
 	if err != nil {
 		t.Fatalf("creating consumer 2: %v", err)
 	}
@@ -461,7 +476,6 @@ func TestRetryableError(t *testing.T) {
 	defer producer.Close()
 
 	ctx := t.Context()
-
 	now := time.Now().Truncate(time.Second)
 
 	var mu sync.Mutex
@@ -469,22 +483,28 @@ func TestRetryableError(t *testing.T) {
 	var retriedJob job.Job
 	done := make(chan struct{})
 
-	consumer, err := kfk.NewConsumer(brokers, groupID, topic, producer, func(ctx context.Context, j job.Job) error {
+	p := pool.New(2, func(ctx context.Context, j job.Job) {
 		mu.Lock()
 		attempts[j.JobID()]++
 		attempt := attempts[j.JobID()]
 		mu.Unlock()
 
 		if attempt == 1 {
-			return job.MakeRetryable(fmt.Errorf("temporary failure"))
+			rescheduled := j.Reschedule(time.Now())
+			if sendErr := producer.Send(ctx, rescheduled); sendErr != nil {
+				t.Logf("rescheduling failed: %v", sendErr)
+			}
+			return
 		}
 
 		mu.Lock()
 		retriedJob = j
 		mu.Unlock()
 		close(done)
-		return nil
 	})
+	defer p.Close()
+
+	consumer, err := kfk.NewConsumer(brokers, groupID, topic, p)
 	if err != nil {
 		t.Fatalf("creating consumer: %v", err)
 	}

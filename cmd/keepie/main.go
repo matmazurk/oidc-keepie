@@ -11,8 +11,10 @@ import (
 
 	"github.com/matmazurk/oidc-keepie/api"
 	"github.com/matmazurk/oidc-keepie/handler"
+	"github.com/matmazurk/oidc-keepie/job"
 	"github.com/matmazurk/oidc-keepie/kafka"
 	keepieotel "github.com/matmazurk/oidc-keepie/otel"
+	"github.com/matmazurk/oidc-keepie/pool"
 )
 
 func main() {
@@ -42,7 +44,6 @@ func main() {
 		slog.Error("creating producer", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	defer producer.Close()
 
 	httpClient := &http.Client{
 		Transport: &http.Transport{
@@ -51,17 +52,56 @@ func main() {
 			IdleConnTimeout:     90 * time.Second,
 		},
 	}
-	handle := handler.New(&stubIssuer{}, httpClient)
+	rawHandler := handler.New(&stubIssuer{}, httpClient)
 
-	consumer, err := kafka.NewConsumer(cfg.brokers, cfg.groupID, cfg.topic, producer, handle)
+	wrappedHandler := func(ctx context.Context, j job.Job) {
+		start := time.Now()
+		if err := rawHandler(ctx, j); err != nil {
+			keepieotel.RecordProcessingDuration(ctx, time.Since(start))
+
+			if job.IsRetryable(err) {
+				rescheduled := j.Reschedule(time.Now())
+				keepieotel.JobRescheduled(ctx)
+				slog.Info("rescheduling retryable job",
+					slog.String("job_id", j.JobID()),
+					slog.String("error", err.Error()),
+				)
+				if sendErr := producer.Send(ctx, rescheduled); sendErr != nil {
+					slog.Error("rescheduling job",
+						slog.String("job_id", j.JobID()),
+						slog.String("error", sendErr.Error()),
+					)
+				}
+				return
+			}
+
+			keepieotel.JobFailed(ctx)
+			slog.Error("handling job",
+				slog.String("job_id", j.JobID()),
+				slog.String("error", err.Error()),
+			)
+			return
+		}
+
+		keepieotel.RecordProcessingDuration(ctx, time.Since(start))
+		keepieotel.JobProcessed(ctx)
+		slog.Debug("job processed successfully",
+			slog.String("job_id", j.JobID()),
+		)
+	}
+
+	workerPool := pool.New(cfg.poolSize, wrappedHandler)
+
+	consumer, err := kafka.NewConsumer(cfg.brokers, cfg.groupID, cfg.topic, workerPool)
 	if err != nil {
 		slog.Error("creating consumer", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	defer consumer.Close()
 
 	go func() {
-		slog.Info("starting consumer")
+		slog.Info("starting consumer",
+			slog.Int("pool_size", cfg.poolSize),
+		)
 		if err := consumer.Start(ctx); err != nil {
 			slog.Error("consumer stopped", slog.String("error", err.Error()))
 		}
@@ -89,6 +129,10 @@ func main() {
 	if err := server.Shutdown(context.Background()); err != nil {
 		slog.Error("HTTP server shutdown", slog.String("error", err.Error()))
 	}
+
+	consumer.Close()
+	workerPool.Close()
+	producer.Close()
 }
 
 type stubIssuer struct{}

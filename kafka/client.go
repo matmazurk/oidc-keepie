@@ -10,6 +10,7 @@ import (
 
 	"github.com/matmazurk/oidc-keepie/job"
 	keepieotel "github.com/matmazurk/oidc-keepie/otel"
+	"github.com/matmazurk/oidc-keepie/pool"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -59,15 +60,16 @@ func (p *Producer) Close() {
 	p.client.Close()
 }
 
-type Handler func(ctx context.Context, j job.Job) error
-
-type Consumer struct {
-	client   *kgo.Client
-	producer *Producer
-	handler  Handler
+type Submitter interface {
+	Submit(ctx context.Context, j pool.Job) error
 }
 
-func NewConsumer(brokers []string, groupID, topic string, producer *Producer, handler Handler) (*Consumer, error) {
+type Consumer struct {
+	client    *kgo.Client
+	submitter Submitter
+}
+
+func NewConsumer(brokers []string, groupID, topic string, submitter Submitter) (*Consumer, error) {
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumerGroup(groupID),
@@ -80,9 +82,8 @@ func NewConsumer(brokers []string, groupID, topic string, producer *Producer, ha
 	}
 
 	return &Consumer{
-		client:   client,
-		producer: producer,
-		handler:  handler,
+		client:    client,
+		submitter: submitter,
 	}, nil
 }
 
@@ -119,20 +120,14 @@ func (c *Consumer) processRecord(ctx context.Context, record *kgo.Record) {
 
 	received := time.Now()
 
-	if err := c.client.CommitRecords(ctx, record); err != nil {
-		slog.Error("committing offset",
-			slog.String("error", err.Error()),
-			slog.Int("partition", int(record.Partition)),
-			slog.Int64("offset", record.Offset),
-		)
-		keepieotel.OffsetCommitError(ctx)
-		return
-	}
-
+	// unmarshal before submit — poison pill prevention
 	var kj kafkaJob
 	if err := json.Unmarshal(record.Value, &kj); err != nil {
 		slog.Error("unmarshaling message", slog.String("error", err.Error()))
 		keepieotel.UnmarshalError(ctx)
+		if commitErr := c.client.CommitRecords(ctx, record); commitErr != nil {
+			slog.Error("committing poison pill offset", slog.String("error", commitErr.Error()))
+		}
 		return
 	}
 
@@ -140,6 +135,9 @@ func (c *Consumer) processRecord(ctx context.Context, record *kgo.Record) {
 	if err != nil {
 		slog.Error("converting kafka job to domain job", slog.String("error", err.Error()))
 		keepieotel.UnmarshalError(ctx)
+		if commitErr := c.client.CommitRecords(ctx, record); commitErr != nil {
+			slog.Error("committing bad job offset", slog.String("error", commitErr.Error()))
+		}
 		return
 	}
 
@@ -150,44 +148,30 @@ func (c *Consumer) processRecord(ctx context.Context, record *kgo.Record) {
 		keepieotel.RecordTimeInQueue(ctx, received.Sub(j.CreatedAt()))
 	}
 
-	slog.Debug("processing job",
+	slog.Debug("submitting job to pool",
 		slog.String("job_id", j.JobID()),
 		slog.Int("partition", int(record.Partition)),
 		slog.Int64("offset", record.Offset),
 		slog.Int("retry_count", j.RetryCount()),
 	)
 
-	start := time.Now()
-	if err := c.handler(ctx, j); err != nil {
-		keepieotel.RecordProcessingDuration(ctx, time.Since(start))
-
-		if job.IsRetryable(err) {
-			rescheduled := j.Reschedule(time.Now())
-			keepieotel.JobRescheduled(ctx)
-
-			slog.Info("rescheduling retryable job",
-				slog.Any("job", rescheduled),
-				slog.String("error", err.Error()),
-			)
-
-			if sendErr := c.producer.Send(ctx, rescheduled); sendErr != nil {
-				slog.Error("rescheduling job", slog.String("job_id", j.JobID()), slog.String("error", sendErr.Error()))
-			}
-
-			return
+	commitFn := func() error {
+		if err := c.client.CommitRecords(ctx, record); err != nil {
+			keepieotel.OffsetCommitError(ctx)
+			return err
 		}
-		keepieotel.JobFailed(ctx)
-		slog.Error("handling job", slog.String("job_id", j.JobID()), slog.String("error", err.Error()))
-		return
+		return nil
 	}
 
-	keepieotel.RecordProcessingDuration(ctx, time.Since(start))
-	keepieotel.JobProcessed(ctx)
-
-	slog.Debug("job processed successfully",
-		slog.String("job_id", j.JobID()),
-		slog.Duration("duration", time.Since(start)),
-	)
+	if err := c.submitter.Submit(ctx, pool.Job{
+		Payload: j,
+		Commit:  commitFn,
+	}); err != nil {
+		slog.Error("submitting job to pool",
+			slog.String("job_id", j.JobID()),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 func (c *Consumer) Close() {
