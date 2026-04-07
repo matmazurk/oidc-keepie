@@ -15,13 +15,13 @@ import (
 	"github.com/matmazurk/oidc-keepie/job"
 	kfk "github.com/matmazurk/oidc-keepie/kafka"
 	"github.com/matmazurk/oidc-keepie/pool"
-	"github.com/twmb/franz-go/pkg/kadm"
-	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 var (
 	brokers []string
 	tlsCfg  *tls.Config
+	topic   string
+	runID   string
 )
 
 func TestMain(m *testing.M) {
@@ -31,6 +31,11 @@ func TestMain(m *testing.M) {
 		os.Exit(m.Run())
 	}
 	brokers = strings.Split(brokersEnv, ",")
+
+	topic = os.Getenv("KAFKA_TEST_TOPIC")
+	if topic == "" {
+		panic("KAFKA_TEST_BROKERS is set but KAFKA_TEST_TOPIC is not set")
+	}
 
 	caFile := os.Getenv("KAFKA_TEST_CA_FILE")
 	certFile := os.Getenv("KAFKA_TEST_CERT_FILE")
@@ -45,6 +50,8 @@ func TestMain(m *testing.M) {
 		panic(fmt.Sprintf("loading kafka test tls config: %v", err))
 	}
 
+	runID = fmt.Sprintf("run-%d", time.Now().UnixNano())
+
 	os.Exit(m.Run())
 }
 
@@ -55,29 +62,36 @@ func requireKafka(t *testing.T) {
 	}
 }
 
-func createTopic(t *testing.T, topic string, partitions int) {
+func newTestID(t *testing.T) string {
 	t.Helper()
+	return runID + "-" + t.Name()
+}
 
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(brokers...),
-		kgo.DialTLSConfig(tlsCfg),
-	)
-	if err != nil {
-		t.Fatalf("creating admin client: %v", err)
-	}
-	defer client.Close()
+func taggedJobID(testID, base string) string {
+	return testID + ":" + base
+}
 
-	admin := kadm.NewClient(client)
-	_, err = admin.CreateTopic(context.Background(), int32(partitions), 1, nil, topic)
-	if err != nil {
-		t.Fatalf("creating topic %s: %v", topic, err)
+func stripTag(testID, jobID string) string {
+	return strings.TrimPrefix(jobID, testID+":")
+}
+
+// filteringHandler wraps a job handler so that jobs not tagged for this
+// test are silently dropped before reaching the real handler. Used so that
+// tests sharing a single topic do not see each other's messages.
+func filteringHandler(testID string, inner func(context.Context, job.Job)) func(context.Context, job.Job) {
+	prefix := testID + ":"
+	return func(ctx context.Context, j job.Job) {
+		if !strings.HasPrefix(j.JobID(), prefix) {
+			return
+		}
+		inner(ctx, j)
 	}
 }
 
 func TestProduceAndConsume(t *testing.T) {
 	requireKafka(t)
-	topic := fmt.Sprintf("test-produce-consume-%d", time.Now().UnixNano())
-	createTopic(t, topic, 6)
+	testID := newTestID(t)
+	groupID := testID
 
 	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
@@ -88,19 +102,15 @@ func TestProduceAndConsume(t *testing.T) {
 	ctx := t.Context()
 
 	now := time.Now().Truncate(time.Second)
-	j := job.MustNew("job-1", "https://example.com/webhook", now)
-
-	if err := producer.Send(ctx, j); err != nil {
-		t.Fatalf("sending message: %v", err)
-	}
+	j := job.MustNew(taggedJobID(testID, "job-1"), "https://example.com/webhook", now)
 
 	received := make(chan job.Job, 1)
-	p := pool.New(2, func(ctx context.Context, j job.Job) {
+	p := pool.New(2, filteringHandler(testID, func(ctx context.Context, j job.Job) {
 		received <- j
-	})
+	}))
 	defer p.Close()
 
-	consumer, err := kfk.NewConsumer(brokers, "test-group-produce-consume", topic, p, tlsCfg)
+	consumer, err := kfk.NewConsumer(brokers, groupID, topic, p, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating consumer: %v", err)
 	}
@@ -112,10 +122,17 @@ func TestProduceAndConsume(t *testing.T) {
 		}
 	}()
 
+	// wait for consumer to join the group and position at end-of-log
+	time.Sleep(5 * time.Second)
+
+	if err := producer.Send(ctx, j); err != nil {
+		t.Fatalf("sending message: %v", err)
+	}
+
 	select {
 	case got := <-received:
-		if got.JobID() != "job-1" {
-			t.Errorf("expected JobID job-1, got %s", got.JobID())
+		if stripTag(testID, got.JobID()) != "job-1" {
+			t.Errorf("expected JobID job-1, got %s", stripTag(testID, got.JobID()))
 		}
 		if got.WebhookURL() != "https://example.com/webhook" {
 			t.Errorf("expected WebhookURL https://example.com/webhook, got %s", got.WebhookURL())
@@ -134,10 +151,13 @@ func TestProduceAndConsume(t *testing.T) {
 	}
 }
 
+// TestWorkloadDistribution assumes the shared test topic has at least 2
+// partitions. With only 1 partition, only one consumer in the group will
+// receive messages and this test will (correctly) fail.
 func TestWorkloadDistribution(t *testing.T) {
 	requireKafka(t)
-	topic := fmt.Sprintf("test-workload-%d", time.Now().UnixNano())
-	createTopic(t, topic, 6)
+	testID := newTestID(t)
+	groupID := testID
 
 	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
@@ -156,20 +176,19 @@ func TestWorkloadDistribution(t *testing.T) {
 		"consumer-2": {},
 	}
 	allReceived := make(chan struct{})
+	var closedOnce sync.Once
 
 	makeHandler := func(name string) func(context.Context, job.Job) {
-		return func(ctx context.Context, j job.Job) {
+		return filteringHandler(testID, func(ctx context.Context, j job.Job) {
 			mu.Lock()
 			defer mu.Unlock()
-			receivedByConsumer[name] = append(receivedByConsumer[name], j.JobID())
+			receivedByConsumer[name] = append(receivedByConsumer[name], stripTag(testID, j.JobID()))
 			total := len(receivedByConsumer["consumer-1"]) + len(receivedByConsumer["consumer-2"])
 			if total == messageCount {
-				close(allReceived)
+				closedOnce.Do(func() { close(allReceived) })
 			}
-		}
+		})
 	}
-
-	groupID := fmt.Sprintf("test-group-workload-%d", time.Now().UnixNano())
 
 	p1 := pool.New(2, makeHandler("consumer-1"))
 	defer p1.Close()
@@ -203,7 +222,7 @@ func TestWorkloadDistribution(t *testing.T) {
 
 	for i := range messageCount {
 		j := job.MustNew(
-			fmt.Sprintf("job-%d", i),
+			taggedJobID(testID, fmt.Sprintf("job-%d", i)),
 			"https://example.com/webhook",
 			now,
 		)
@@ -256,8 +275,8 @@ func TestWorkloadDistribution(t *testing.T) {
 
 func TestConsumerRebalancing(t *testing.T) {
 	requireKafka(t)
-	topic := fmt.Sprintf("test-rebalance-%d", time.Now().UnixNano())
-	createTopic(t, topic, 6)
+	testID := newTestID(t)
+	groupID := testID
 
 	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
@@ -268,7 +287,6 @@ func TestConsumerRebalancing(t *testing.T) {
 	ctx := t.Context()
 
 	now := time.Now().Truncate(time.Second)
-	groupID := fmt.Sprintf("test-group-rebalance-%d", time.Now().UnixNano())
 
 	var mu sync.Mutex
 	consumer1Messages := []string{}
@@ -277,12 +295,13 @@ func TestConsumerRebalancing(t *testing.T) {
 	consumer1Received := make(chan string, 100)
 	consumer2Received := make(chan string, 100)
 
-	p1 := pool.New(2, func(ctx context.Context, j job.Job) {
+	p1 := pool.New(2, filteringHandler(testID, func(ctx context.Context, j job.Job) {
+		id := stripTag(testID, j.JobID())
 		mu.Lock()
-		consumer1Messages = append(consumer1Messages, j.JobID())
+		consumer1Messages = append(consumer1Messages, id)
 		mu.Unlock()
-		consumer1Received <- j.JobID()
-	})
+		consumer1Received <- id
+	}))
 	defer p1.Close()
 
 	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1, tlsCfg)
@@ -290,12 +309,13 @@ func TestConsumerRebalancing(t *testing.T) {
 		t.Fatalf("creating consumer 1: %v", err)
 	}
 
-	p2 := pool.New(2, func(ctx context.Context, j job.Job) {
+	p2 := pool.New(2, filteringHandler(testID, func(ctx context.Context, j job.Job) {
+		id := stripTag(testID, j.JobID())
 		mu.Lock()
-		consumer2Messages = append(consumer2Messages, j.JobID())
+		consumer2Messages = append(consumer2Messages, id)
 		mu.Unlock()
-		consumer2Received <- j.JobID()
-	})
+		consumer2Received <- id
+	}))
 	defer p2.Close()
 
 	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2, tlsCfg)
@@ -323,7 +343,7 @@ func TestConsumerRebalancing(t *testing.T) {
 
 	// send messages while both consumers are active
 	for i := range 5 {
-		j := job.MustNew(fmt.Sprintf("job-phase1-%d", i), "https://example.com/webhook", now)
+		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-phase1-%d", i)), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, j); err != nil {
 			t.Fatalf("sending phase 1 message %d: %v", i, err)
 		}
@@ -351,7 +371,7 @@ func TestConsumerRebalancing(t *testing.T) {
 
 	// send more messages — consumer 2 should get all of them
 	for i := range 5 {
-		j := job.MustNew(fmt.Sprintf("job-phase2-%d", i), "https://example.com/webhook", now)
+		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-phase2-%d", i)), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, j); err != nil {
 			t.Fatalf("sending phase 2 message %d: %v", i, err)
 		}
@@ -380,9 +400,8 @@ func TestConsumerRebalancing(t *testing.T) {
 
 func TestOffsetPersistence(t *testing.T) {
 	requireKafka(t)
-	topic := fmt.Sprintf("test-offset-%d", time.Now().UnixNano())
-	createTopic(t, topic, 6)
-	groupID := fmt.Sprintf("test-group-offset-%d", time.Now().UnixNano())
+	testID := newTestID(t)
+	groupID := testID
 
 	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
@@ -394,19 +413,11 @@ func TestOffsetPersistence(t *testing.T) {
 
 	now := time.Now().Truncate(time.Second)
 
-	// send 3 messages
-	for i := range 3 {
-		j := job.MustNew(fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
-		if err := producer.Send(ctx, j); err != nil {
-			t.Fatalf("sending message %d: %v", i, err)
-		}
-	}
-
-	// consume all 3 messages with first consumer
+	// start consumer 1 first so the brand-new group is positioned at end-of-log
 	received1 := make(chan string, 10)
-	p1 := pool.New(2, func(ctx context.Context, j job.Job) {
-		received1 <- j.JobID()
-	})
+	p1 := pool.New(2, filteringHandler(testID, func(ctx context.Context, j job.Job) {
+		received1 <- stripTag(testID, j.JobID())
+	}))
 	defer p1.Close()
 
 	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1, tlsCfg)
@@ -415,12 +426,22 @@ func TestOffsetPersistence(t *testing.T) {
 	}
 
 	ctx1, cancel1 := context.WithCancel(ctx)
-
 	go func() {
 		if err := consumer1.Start(ctx1); err != nil {
 			t.Logf("consumer 1 stopped: %v", err)
 		}
 	}()
+
+	// wait for consumer to join and position at end-of-log
+	time.Sleep(5 * time.Second)
+
+	// send 3 messages
+	for i := range 3 {
+		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
+		if err := producer.Send(ctx, j); err != nil {
+			t.Fatalf("sending message %d: %v", i, err)
+		}
+	}
 
 	count := 0
 	for count < 3 {
@@ -438,7 +459,7 @@ func TestOffsetPersistence(t *testing.T) {
 
 	// send 2 more messages
 	for i := 3; i < 5; i++ {
-		j := job.MustNew(fmt.Sprintf("job-%d", i), "https://example.com/webhook", now)
+		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, j); err != nil {
 			t.Fatalf("sending message %d: %v", i, err)
 		}
@@ -446,9 +467,9 @@ func TestOffsetPersistence(t *testing.T) {
 
 	// start a new consumer in the same group — should only get the 2 new messages
 	received2 := make(chan string, 10)
-	p2 := pool.New(2, func(ctx context.Context, j job.Job) {
-		received2 <- j.JobID()
-	})
+	p2 := pool.New(2, filteringHandler(testID, func(ctx context.Context, j job.Job) {
+		received2 <- stripTag(testID, j.JobID())
+	}))
 	defer p2.Close()
 
 	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2, tlsCfg)
@@ -491,9 +512,8 @@ func TestOffsetPersistence(t *testing.T) {
 
 func TestRetryableError(t *testing.T) {
 	requireKafka(t)
-	topic := fmt.Sprintf("test-retryable-%d", time.Now().UnixNano())
-	createTopic(t, topic, 6)
-	groupID := fmt.Sprintf("test-group-retryable-%d", time.Now().UnixNano())
+	testID := newTestID(t)
+	groupID := testID
 
 	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
@@ -508,8 +528,9 @@ func TestRetryableError(t *testing.T) {
 	attempts := map[string]int{}
 	var retriedJob job.Job
 	done := make(chan struct{})
+	var doneOnce sync.Once
 
-	p := pool.New(2, func(ctx context.Context, j job.Job) {
+	p := pool.New(2, filteringHandler(testID, func(ctx context.Context, j job.Job) {
 		mu.Lock()
 		attempts[j.JobID()]++
 		attempt := attempts[j.JobID()]
@@ -526,8 +547,8 @@ func TestRetryableError(t *testing.T) {
 		mu.Lock()
 		retriedJob = j
 		mu.Unlock()
-		close(done)
-	})
+		doneOnce.Do(func() { close(done) })
+	}))
 	defer p.Close()
 
 	consumer, err := kfk.NewConsumer(brokers, groupID, topic, p, tlsCfg)
@@ -542,7 +563,11 @@ func TestRetryableError(t *testing.T) {
 		}
 	}()
 
-	j := job.MustNew("job-1", "https://example.com/webhook", now)
+	// wait for consumer to join and position at end-of-log
+	time.Sleep(5 * time.Second)
+
+	tagged := taggedJobID(testID, "job-1")
+	j := job.MustNew(tagged, "https://example.com/webhook", now)
 	if err := producer.Send(ctx, j); err != nil {
 		t.Fatalf("sending message: %v", err)
 	}
@@ -556,11 +581,11 @@ func TestRetryableError(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if attempts["job-1"] != 2 {
-		t.Errorf("expected 2 attempts, got %d", attempts["job-1"])
+	if attempts[tagged] != 2 {
+		t.Errorf("expected 2 attempts, got %d", attempts[tagged])
 	}
-	if retriedJob.JobID() != "job-1" {
-		t.Errorf("expected retried job to keep jobID job-1, got %s", retriedJob.JobID())
+	if stripTag(testID, retriedJob.JobID()) != "job-1" {
+		t.Errorf("expected retried job to keep jobID job-1, got %s", stripTag(testID, retriedJob.JobID()))
 	}
 	if retriedJob.RetryCount() != 1 {
 		t.Errorf("expected retry count 1, got %d", retriedJob.RetryCount())

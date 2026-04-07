@@ -34,9 +34,16 @@ before running them:
 | Env var | Description |
 |---|---|
 | `KAFKA_TEST_BROKERS` | Comma-separated broker list. If unset, all integration tests skip. |
+| `KAFKA_TEST_TOPIC` | Pre-existing topic shared by all integration tests (required when `KAFKA_TEST_BROKERS` is set). The tests do not create or delete topics. Should have **≥2 partitions** so `TestWorkloadDistribution` can verify multi-consumer distribution. |
 | `KAFKA_TEST_CA_FILE` | CA PEM (required when `KAFKA_TEST_BROKERS` is set) |
 | `KAFKA_TEST_CERT_FILE` | Client cert PEM (required when `KAFKA_TEST_BROKERS` is set) |
 | `KAFKA_TEST_KEY_FILE` | Client key PEM (required when `KAFKA_TEST_BROKERS` is set) |
+
+Tests share the configured topic. Each test uses a unique consumer group ID
+derived from a per-process run ID plus the test name, and tags every produced
+`JobID` with that prefix. A filtering wrapper around the worker pool drops any
+incoming job whose `JobID` does not carry the current test's prefix, so tests
+do not see each other's messages or any historical data on the topic.
 
 Run with: `go test -tags=integration ./kafka/...`
 
