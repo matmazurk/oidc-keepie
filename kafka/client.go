@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,9 +20,13 @@ type Producer struct {
 	topic  string
 }
 
-func NewProducer(brokers []string, topic string) (*Producer, error) {
+func NewProducer(brokers []string, topic string, tlsCfg *tls.Config) (*Producer, error) {
+	if tlsCfg == nil {
+		return nil, fmt.Errorf("tls config is required")
+	}
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
+		kgo.DialTLSConfig(tlsCfg),
 		kgo.RecordPartitioner(kgo.RoundRobinPartitioner()),
 	)
 	if err != nil {
@@ -69,9 +74,13 @@ type Consumer struct {
 	submitter Submitter
 }
 
-func NewConsumer(brokers []string, groupID, topic string, submitter Submitter) (*Consumer, error) {
+func NewConsumer(brokers []string, groupID, topic string, submitter Submitter, tlsCfg *tls.Config) (*Consumer, error) {
+	if tlsCfg == nil {
+		return nil, fmt.Errorf("tls config is required")
+	}
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
+		kgo.DialTLSConfig(tlsCfg),
 		kgo.ConsumerGroup(groupID),
 		kgo.ConsumeTopics(topic),
 		kgo.DisableAutoCommit(),

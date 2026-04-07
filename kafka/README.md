@@ -11,6 +11,34 @@ Uses [franz-go](https://github.com/twmb/franz-go) (`kgo`) for both producing and
 | Offset commit | Manual, commit-first | Commit before processing to prevent duplicate JWTs |
 | Partitioning | Round-robin (no key) | Jobs are independent, we want even distribution |
 | Auto-offset-reset | `earliest` | On first start or expired offsets, process from beginning rather than skip |
+| Transport | mTLS (required) | Broker identity + client auth via X.509; plaintext is not supported |
+
+## mTLS
+
+The client connects over mTLS only. At startup, `NewProducer` and
+`NewConsumer` require a non-nil `*tls.Config`. The `cmd/keepie` binary builds
+one via `kafka.LoadTLSConfig(...)` from these env vars (all required):
+
+| Env var | Description |
+|---|---|
+| `KAFKA_TLS_CA_FILE` | PEM file with the CA that signed the broker cert |
+| `KAFKA_TLS_CERT_FILE` | Client certificate PEM |
+| `KAFKA_TLS_KEY_FILE` | Client private key PEM |
+
+## Integration tests
+
+Integration tests (`//go:build integration`) connect to an **existing**
+kafka broker — they no longer spin up a testcontainer. Set these env vars
+before running them:
+
+| Env var | Description |
+|---|---|
+| `KAFKA_TEST_BROKERS` | Comma-separated broker list. If unset, all integration tests skip. |
+| `KAFKA_TEST_CA_FILE` | CA PEM (required when `KAFKA_TEST_BROKERS` is set) |
+| `KAFKA_TEST_CERT_FILE` | Client cert PEM (required when `KAFKA_TEST_BROKERS` is set) |
+| `KAFKA_TEST_KEY_FILE` | Client key PEM (required when `KAFKA_TEST_BROKERS` is set) |
+
+Run with: `go test -tags=integration ./kafka/...`
 
 ---
 

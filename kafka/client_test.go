@@ -4,7 +4,10 @@ package kafka_test
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,35 +15,53 @@ import (
 	"github.com/matmazurk/oidc-keepie/job"
 	kfk "github.com/matmazurk/oidc-keepie/kafka"
 	"github.com/matmazurk/oidc-keepie/pool"
-	tc "github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/kafka"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-var brokers []string
+var (
+	brokers []string
+	tlsCfg  *tls.Config
+)
 
 func TestMain(m *testing.M) {
-	ctx := context.Background()
-
-	kafkaContainer, err := kafka.Run(ctx, "confluentinc/confluent-local:7.5.0")
-	if err != nil {
-		panic(fmt.Sprintf("starting kafka container: %v", err))
+	brokersEnv := os.Getenv("KAFKA_TEST_BROKERS")
+	if brokersEnv == "" {
+		// Not configured — tests will skip via requireKafka.
+		os.Exit(m.Run())
 	}
-	defer tc.TerminateContainer(kafkaContainer)
+	brokers = strings.Split(brokersEnv, ",")
 
-	brokers, err = kafkaContainer.Brokers(ctx)
-	if err != nil {
-		panic(fmt.Sprintf("getting brokers: %v", err))
+	caFile := os.Getenv("KAFKA_TEST_CA_FILE")
+	certFile := os.Getenv("KAFKA_TEST_CERT_FILE")
+	keyFile := os.Getenv("KAFKA_TEST_KEY_FILE")
+	if caFile == "" || certFile == "" || keyFile == "" {
+		panic("KAFKA_TEST_BROKERS is set but KAFKA_TEST_CA_FILE/KAFKA_TEST_CERT_FILE/KAFKA_TEST_KEY_FILE are not all set")
 	}
 
-	m.Run()
+	var err error
+	tlsCfg, err = kfk.LoadTLSConfig(caFile, certFile, keyFile)
+	if err != nil {
+		panic(fmt.Sprintf("loading kafka test tls config: %v", err))
+	}
+
+	os.Exit(m.Run())
+}
+
+func requireKafka(t *testing.T) {
+	t.Helper()
+	if len(brokers) == 0 {
+		t.Skip("KAFKA_TEST_BROKERS not set; skipping kafka integration test")
+	}
 }
 
 func createTopic(t *testing.T, topic string, partitions int) {
 	t.Helper()
 
-	client, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.DialTLSConfig(tlsCfg),
+	)
 	if err != nil {
 		t.Fatalf("creating admin client: %v", err)
 	}
@@ -54,10 +75,11 @@ func createTopic(t *testing.T, topic string, partitions int) {
 }
 
 func TestProduceAndConsume(t *testing.T) {
+	requireKafka(t)
 	topic := fmt.Sprintf("test-produce-consume-%d", time.Now().UnixNano())
 	createTopic(t, topic, 6)
 
-	producer, err := kfk.NewProducer(brokers, topic)
+	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating producer: %v", err)
 	}
@@ -78,7 +100,7 @@ func TestProduceAndConsume(t *testing.T) {
 	})
 	defer p.Close()
 
-	consumer, err := kfk.NewConsumer(brokers, "test-group-produce-consume", topic, p)
+	consumer, err := kfk.NewConsumer(brokers, "test-group-produce-consume", topic, p, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating consumer: %v", err)
 	}
@@ -113,10 +135,11 @@ func TestProduceAndConsume(t *testing.T) {
 }
 
 func TestWorkloadDistribution(t *testing.T) {
+	requireKafka(t)
 	topic := fmt.Sprintf("test-workload-%d", time.Now().UnixNano())
 	createTopic(t, topic, 6)
 
-	producer, err := kfk.NewProducer(brokers, topic)
+	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating producer: %v", err)
 	}
@@ -150,7 +173,7 @@ func TestWorkloadDistribution(t *testing.T) {
 
 	p1 := pool.New(2, makeHandler("consumer-1"))
 	defer p1.Close()
-	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1)
+	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating consumer 1: %v", err)
 	}
@@ -158,7 +181,7 @@ func TestWorkloadDistribution(t *testing.T) {
 
 	p2 := pool.New(2, makeHandler("consumer-2"))
 	defer p2.Close()
-	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2)
+	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating consumer 2: %v", err)
 	}
@@ -232,10 +255,11 @@ func TestWorkloadDistribution(t *testing.T) {
 }
 
 func TestConsumerRebalancing(t *testing.T) {
+	requireKafka(t)
 	topic := fmt.Sprintf("test-rebalance-%d", time.Now().UnixNano())
 	createTopic(t, topic, 6)
 
-	producer, err := kfk.NewProducer(brokers, topic)
+	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating producer: %v", err)
 	}
@@ -261,7 +285,7 @@ func TestConsumerRebalancing(t *testing.T) {
 	})
 	defer p1.Close()
 
-	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1)
+	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating consumer 1: %v", err)
 	}
@@ -274,7 +298,7 @@ func TestConsumerRebalancing(t *testing.T) {
 	})
 	defer p2.Close()
 
-	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2)
+	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating consumer 2: %v", err)
 	}
@@ -355,11 +379,12 @@ func TestConsumerRebalancing(t *testing.T) {
 }
 
 func TestOffsetPersistence(t *testing.T) {
+	requireKafka(t)
 	topic := fmt.Sprintf("test-offset-%d", time.Now().UnixNano())
 	createTopic(t, topic, 6)
 	groupID := fmt.Sprintf("test-group-offset-%d", time.Now().UnixNano())
 
-	producer, err := kfk.NewProducer(brokers, topic)
+	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating producer: %v", err)
 	}
@@ -384,7 +409,7 @@ func TestOffsetPersistence(t *testing.T) {
 	})
 	defer p1.Close()
 
-	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1)
+	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating consumer 1: %v", err)
 	}
@@ -426,7 +451,7 @@ func TestOffsetPersistence(t *testing.T) {
 	})
 	defer p2.Close()
 
-	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2)
+	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating consumer 2: %v", err)
 	}
@@ -465,11 +490,12 @@ func TestOffsetPersistence(t *testing.T) {
 }
 
 func TestRetryableError(t *testing.T) {
+	requireKafka(t)
 	topic := fmt.Sprintf("test-retryable-%d", time.Now().UnixNano())
 	createTopic(t, topic, 6)
 	groupID := fmt.Sprintf("test-group-retryable-%d", time.Now().UnixNano())
 
-	producer, err := kfk.NewProducer(brokers, topic)
+	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating producer: %v", err)
 	}
@@ -504,7 +530,7 @@ func TestRetryableError(t *testing.T) {
 	})
 	defer p.Close()
 
-	consumer, err := kfk.NewConsumer(brokers, groupID, topic, p)
+	consumer, err := kfk.NewConsumer(brokers, groupID, topic, p, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating consumer: %v", err)
 	}

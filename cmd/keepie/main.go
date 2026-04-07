@@ -39,7 +39,13 @@ func main() {
 	}
 	defer mp.Shutdown(context.Background())
 
-	producer, err := kafka.NewProducer(cfg.brokers, cfg.topic)
+	tlsCfg, err := kafka.LoadTLSConfig(cfg.tlsCAFile, cfg.tlsCertFile, cfg.tlsKeyFile)
+	if err != nil {
+		slog.Error("loading kafka tls config", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	producer, err := kafka.NewProducer(cfg.brokers, cfg.topic, tlsCfg)
 	if err != nil {
 		slog.Error("creating producer", slog.String("error", err.Error()))
 		os.Exit(1)
@@ -92,7 +98,7 @@ func main() {
 
 	workerPool := pool.New(cfg.poolSize, wrappedHandler)
 
-	consumer, err := kafka.NewConsumer(cfg.brokers, cfg.groupID, cfg.topic, workerPool)
+	consumer, err := kafka.NewConsumer(cfg.brokers, cfg.groupID, cfg.topic, workerPool, tlsCfg)
 	if err != nil {
 		slog.Error("creating consumer", slog.String("error", err.Error()))
 		os.Exit(1)
