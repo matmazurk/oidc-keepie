@@ -18,10 +18,11 @@ import (
 )
 
 var (
-	brokers []string
-	tlsCfg  *tls.Config
-	topic   string
-	runID   string
+	brokers     []string
+	tlsCfg      *tls.Config
+	topic       string
+	groupPrefix string
+	runID       string
 )
 
 func TestMain(m *testing.M) {
@@ -44,6 +45,8 @@ func TestMain(m *testing.M) {
 		panic("KAFKA_TEST_BROKERS is set but KAFKA_TEST_CA_FILE/KAFKA_TEST_CERT_FILE/KAFKA_TEST_KEY_FILE are not all set")
 	}
 
+	groupPrefix = os.Getenv("KAFKA_TEST_GROUP_PREFIX")
+
 	var err error
 	tlsCfg, err = kfk.LoadTLSConfig(caFile, certFile, keyFile)
 	if err != nil {
@@ -64,7 +67,7 @@ func requireKafka(t *testing.T) {
 
 func newTestID(t *testing.T) string {
 	t.Helper()
-	return runID + "-" + t.Name()
+	return groupPrefix + runID + "-" + t.Name()
 }
 
 func taggedJobID(testID, base string) string {
