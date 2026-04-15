@@ -167,7 +167,7 @@ func (c *Consumer) processRecord(ctx context.Context, record *kgo.Record) {
 	)
 
 	commitFn := func() error {
-		if err := c.client.CommitRecords(ctx, record); err != nil {
+		if err := c.client.CommitRecords(context.Background(), record); err != nil {
 			keepieotel.OffsetCommitError(ctx)
 			return err
 		}

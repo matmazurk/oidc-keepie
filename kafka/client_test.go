@@ -490,11 +490,7 @@ func TestConsumerRebalancing(t *testing.T) {
 func TestOffsetPersistence(t *testing.T) {
 	requireKafka(t)
 	t.Parallel()
-	// Two distinct testIDs for each phase. Same group — consumer 2 resumes
-	// from consumer 1's committed offsets. Separate tags so any phase-1
-	// messages replayed during consumer 2's catch-up are filtered out.
-	testID1 := newTestID(t)
-	testID2 := newTestID(t)
+	testID := newTestID(t)
 	groupID := newGroupID(t)
 
 	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
@@ -510,8 +506,8 @@ func TestOffsetPersistence(t *testing.T) {
 	// --- phase 1: consumer 1 processes job-0..2, commits offsets ---
 	received1 := make(chan string, 10)
 	sync1 := make(chan struct{}, partitions)
-	p1 := pool.New(1, syncingHandler(testID1, sync1, func(ctx context.Context, j job.Job) {
-		received1 <- stripTag(testID1, j.JobID())
+	p1 := pool.New(1, syncingHandler(testID, sync1, func(ctx context.Context, j job.Job) {
+		received1 <- stripTag(testID, j.JobID())
 	}))
 
 	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1, tlsCfg, kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()))
@@ -524,10 +520,10 @@ func TestOffsetPersistence(t *testing.T) {
 		_ = consumer1.Start(ctx1)
 	}()
 
-	waitForSync(t, ctx, producer, testID1, sync1)
+	waitForSync(t, ctx, producer, testID, sync1)
 
 	for i := range 3 {
-		j := job.MustNew(taggedJobID(testID1, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
+		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, j); err != nil {
 			t.Fatalf("sending message %d: %v", i, err)
 		}
@@ -543,19 +539,21 @@ func TestOffsetPersistence(t *testing.T) {
 		}
 	}
 
+	// Close pool first so in-flight commits complete (commitFn now uses
+	// context.Background so they succeed even after cancel).
 	p1.Close()
 	cancel1()
 	consumer1.Close()
 
 	// --- phase 2: consumer 2 joins same group, proves offset resume ---
+	// Default reset is AtStart — committed offsets drive resume, not policy.
 	received2 := make(chan string, 10)
 	sync2 := make(chan struct{}, partitions)
-	p2 := pool.New(2, syncingHandler(testID2, sync2, func(ctx context.Context, j job.Job) {
-		received2 <- stripTag(testID2, j.JobID())
+	p2 := pool.New(2, syncingHandler(testID, sync2, func(ctx context.Context, j job.Job) {
+		received2 <- stripTag(testID, j.JobID())
 	}))
 	defer p2.Close()
 
-	// Default reset is AtStart — committed offsets drive resume, not policy.
 	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating consumer 2: %v", err)
@@ -566,10 +564,11 @@ func TestOffsetPersistence(t *testing.T) {
 		_ = consumer2.Start(ctx)
 	}()
 
-	waitForSync(t, ctx, producer, testID2, sync2)
+	waitForSync(t, ctx, producer, testID, sync2)
 
+	// Produce after sync — consumer 2 is caught up past phase 1.
 	for i := 3; i < 5; i++ {
-		j := job.MustNew(taggedJobID(testID2, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
+		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, j); err != nil {
 			t.Fatalf("sending message %d: %v", i, err)
 		}
@@ -587,6 +586,7 @@ func TestOffsetPersistence(t *testing.T) {
 		}
 	}
 
+	// Assert no phase-1 messages leaked through.
 	select {
 	case id := <-received2:
 		t.Errorf("unexpected extra message received: %s", id)
