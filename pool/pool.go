@@ -20,7 +20,7 @@ type Pool struct {
 	handler func(context.Context, job.Job)
 	jobs    chan Job
 	wg      sync.WaitGroup
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	closed  bool
 }
 
@@ -48,12 +48,15 @@ func (p *Pool) worker() {
 }
 
 func (p *Pool) Submit(ctx context.Context, j Job) error {
-	p.mu.Lock()
+	// RLock is held for the duration of the send so that Close (which takes
+	// the write lock) waits for all in-flight submits to finish before
+	// closing the jobs channel — otherwise a concurrent Close could close
+	// the channel while Submit is about to send on it.
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.closed {
-		p.mu.Unlock()
 		return ErrPoolClosed
 	}
-	p.mu.Unlock()
 
 	select {
 	case p.jobs <- j:

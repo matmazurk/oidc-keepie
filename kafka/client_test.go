@@ -178,6 +178,7 @@ func waitForSync(t *testing.T, ctx context.Context, producer *kfk.Producer, test
 
 func TestProduceAndConsume(t *testing.T) {
 	requireKafka(t)
+	t.Parallel()
 	testID := newTestID(t)
 	groupID := newGroupID(t)
 
@@ -242,6 +243,7 @@ func TestProduceAndConsume(t *testing.T) {
 // receive messages and this test will (correctly) fail.
 func TestWorkloadDistribution(t *testing.T) {
 	requireKafka(t)
+	t.Parallel()
 	testID := newTestID(t)
 	groupID := newGroupID(t)
 
@@ -358,6 +360,7 @@ func TestWorkloadDistribution(t *testing.T) {
 
 func TestConsumerRebalancing(t *testing.T) {
 	requireKafka(t)
+	t.Parallel()
 	testID := newTestID(t)
 	groupID := newGroupID(t)
 
@@ -478,6 +481,7 @@ func TestConsumerRebalancing(t *testing.T) {
 
 func TestOffsetPersistence(t *testing.T) {
 	requireKafka(t)
+	t.Parallel()
 	testID := newTestID(t)
 	groupID := newGroupID(t)
 
@@ -590,6 +594,7 @@ func TestOffsetPersistence(t *testing.T) {
 
 func TestRetryableError(t *testing.T) {
 	requireKafka(t)
+	t.Parallel()
 	testID := newTestID(t)
 	groupID := newGroupID(t)
 
