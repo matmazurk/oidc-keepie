@@ -566,10 +566,32 @@ func TestOffsetPersistence(t *testing.T) {
 		_ = consumer2.Start(ctx)
 	}()
 
-	waitForSync(t, ctx, producer, testID, sync2)
+	// Wait for sync markers on ALL partitions — a single marker only proves
+	// one partition is caught up; consumer 2 might still be behind on others
+	// (AtStart fallback if committed offset was lost during consumer 1 teardown).
+	sendMarkers := func() {
+		for i := range partitions {
+			j := job.MustNew(taggedJobID(testID, fmt.Sprintf("%s%d", syncMarker, i)), "https://example.com/sync", time.Now())
+			producer.Send(ctx, j)
+		}
+	}
+	deadline := time.After(30 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	sendMarkers()
+	for synced := 0; synced < partitions; {
+		select {
+		case <-sync2:
+			synced++
+		case <-ticker.C:
+			sendMarkers()
+		case <-deadline:
+			t.Fatalf("synced %d/%d partitions before timeout", synced, partitions)
+		}
+	}
 
-	// produce 2 more messages — consumer 2 is synced so these will be the
-	// only test messages it sees (job-0,1,2 are past committed offsets).
+	// produce 2 more messages — consumer 2 is synced on every partition so
+	// these will be the only test messages it sees.
 	for i := 3; i < 5; i++ {
 		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, j); err != nil {
