@@ -42,29 +42,52 @@ flowchart TD
 
 ## Submit and backpressure
 
-`Submit` respects context cancellation. When the channel is full (all workers busy and buffer saturated), `Submit` blocks until either a slot opens or the context is cancelled:
+`Submit` holds an `RLock` for the entire check-and-send, preventing a
+concurrent `Close` from closing the channel mid-send. When the channel is
+full (all workers busy and buffer saturated), `Submit` blocks until either a
+slot opens or the context is cancelled:
 
 ```mermaid
 flowchart TD
-    Start["Submit(ctx, job)"] --> Closed{Pool closed?}
-    Closed -->|yes| Err["return ErrPoolClosed"]
+    Start["Submit(ctx, job)"] --> RLock["RLock()"]
+    RLock --> Closed{Pool closed?}
+    Closed -->|yes| Err["RUnlock()\nreturn ErrPoolClosed"]
     Closed -->|no| Select["select"]
-    Select -->|"channel ← job"| OK["return nil"]
-    Select -->|"ctx.Done()"| CtxErr["return ctx.Err()"]
+    Select -->|"channel ← job"| OK["RUnlock()\nreturn nil"]
+    Select -->|"ctx.Done()"| CtxErr["RUnlock()\nreturn ctx.Err()"]
 ```
 
 The buffered channel has capacity equal to the number of workers, so up to `2 * size` jobs can be outstanding at once (size in workers + size in buffer).
 
 ## Graceful shutdown
 
-`Close` ensures all in-flight work finishes before returning:
+`Close` acquires a write lock (waiting for all in-flight `Submit` calls to
+finish their send), then closes the channel so workers drain remaining jobs:
 
 ```mermaid
 flowchart TD
-    Start["Close()"] --> Mark["Mark closed\n(rejects future Submits)"]
-    Mark --> CloseCh["Close channel\n(workers drain remaining jobs)"]
+    Start["Close()"] --> Lock["Lock() — wait for all RLocks"]
+    Lock --> Mark["Set closed = true"]
+    Mark --> Unlock["Unlock()"]
+    Unlock --> CloseCh["Close channel\n(workers drain remaining jobs)"]
     CloseCh --> WgWait["wg.Wait()\n(block until all workers exit)"]
 ```
+
+**Shutdown order matters:** close the pool before the Kafka consumer so that
+in-flight commit functions (which use `context.Background()`) can reach the
+broker while the connection is still alive.
+
+## Caveat: per-partition commit ordering
+
+With multiple workers, two workers can commit records from the same Kafka
+partition out of order. Kafka's `OffsetCommit` is last-write-wins per
+partition, so a slower worker committing offset 51 after a faster worker
+committed offset 104 regresses the committed position to 51. On restart,
+offsets 51–104 get re-delivered.
+
+This is acceptable when the handler is idempotent or when re-delivery is
+tolerable. For strict exactly-once semantics, use pool size 1 or implement
+batched per-partition offset tracking.
 
 ## Usage
 

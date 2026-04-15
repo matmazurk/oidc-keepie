@@ -7,8 +7,8 @@ Uses [franz-go](https://github.com/twmb/franz-go) (`kgo`) for both producing and
 | Setting | Value | Why |
 |---|---|---|
 | Library | `twmb/franz-go` | Synchronous `CommitRecords` returns error, unlike sarama's fire-and-forget |
-| Partitions | 2 | Allows scaling up to 2 consumer instances |
-| Offset commit | Manual, commit-first | Commit before processing to prevent duplicate JWTs |
+| Partitions | 3 (configurable) | Allows scaling up to 3 consumer instances |
+| Offset commit | Manual, commit-first, `context.Background` | Commit before processing to prevent duplicate JWTs; uses background context so commits survive polling-loop cancellation during shutdown |
 | Partitioning | Round-robin (no key) | Jobs are independent, we want even distribution |
 | Auto-offset-reset | `earliest` | On first start or expired offsets, process from beginning rather than skip |
 | Transport | mTLS (required) | Broker identity + client auth via X.509; plaintext is not supported |
@@ -28,24 +28,57 @@ one via `kafka.LoadTLSConfig(...)` from these env vars (all required):
 ## Integration tests
 
 Integration tests (`//go:build integration`) connect to an **existing**
-kafka broker — they no longer spin up a testcontainer. Set these env vars
-before running them:
+Kafka broker — they do not spin up containers or create/delete topics.
+
+### Env vars
 
 | Env var | Description |
 |---|---|
 | `KAFKA_TEST_BROKERS` | Comma-separated broker list. If unset, all integration tests skip. |
-| `KAFKA_TEST_TOPIC` | Pre-existing topic shared by all integration tests (required when `KAFKA_TEST_BROKERS` is set). The tests do not create or delete topics. Should have **≥2 partitions** so `TestWorkloadDistribution` can verify multi-consumer distribution. |
-| `KAFKA_TEST_CA_FILE` | CA PEM (required when `KAFKA_TEST_BROKERS` is set) |
-| `KAFKA_TEST_CERT_FILE` | Client cert PEM (required when `KAFKA_TEST_BROKERS` is set) |
-| `KAFKA_TEST_KEY_FILE` | Client key PEM (required when `KAFKA_TEST_BROKERS` is set) |
+| `KAFKA_TEST_TOPIC` | Pre-existing topic shared by all tests (required). Should have **≥3 partitions**. |
+| `KAFKA_TEST_GROUP_PREFIX` | Prefix for consumer group names (must match hosted ACLs). |
+| `KAFKA_TEST_PARTITIONS` | Partition count of the test topic (default 3). |
+| `KAFKA_TEST_CA_FILE` | CA PEM (required) |
+| `KAFKA_TEST_CERT_FILE` | Client cert PEM (required) |
+| `KAFKA_TEST_KEY_FILE` | Client key PEM (required) |
 
-Tests share the configured topic. Each test uses a unique consumer group ID
-derived from a per-process run ID plus the test name, and tags every produced
-`JobID` with that prefix. A filtering wrapper around the worker pool drops any
-incoming job whose `JobID` does not carry the current test's prefix, so tests
-do not see each other's messages or any historical data on the topic.
+### Design
 
-Run with: `go test -tags=integration ./kafka/...`
+Tests run in **parallel** (`t.Parallel()`) and are stable on a shared topic
+with pre-existing messages from prior runs.
+
+**Stable consumer groups** — each test gets a fixed group name:
+`${KAFKA_TEST_GROUP_PREFIX}${testName}`. The group is reused across runs,
+matching the hosted ACL prefix contract.
+
+**Per-invocation message tagging** — every message is tagged with a unique
+`testID` (`runID-seq-testName`). A `filteringHandler` wrapping the pool
+drops any message whose `JobID` does not carry the current invocation's
+tag, isolating tests from each other and from historical data.
+
+**Sync-marker handshake** — instead of sleeping, each test produces sync
+markers (one per partition via round-robin) and waits for the consumer to
+receive them. This proves the consumer is caught up to end-of-log before
+the test produces real work. Markers are resent every 2 seconds to handle
+rebalance windows.
+
+### Local development
+
+```bash
+# generate mTLS certs (once)
+./scripts/local-kafka-certs.sh
+
+# start local Kafka + create test topic
+make test-kafka-up
+
+# run tests
+make test-integration-local
+
+# teardown
+make test-kafka-down
+```
+
+Or manually: `go test -tags=integration -count=1 -v -timeout 5m ./kafka/`
 
 ---
 
@@ -71,33 +104,37 @@ sequenceDiagram
 
 ### Consumer
 
-The consumer joins a consumer group. Kafka assigns partitions to it. `PollFetches` returns batches of records from all assigned partitions. Records are processed sequentially, one at a time.
+The consumer joins a consumer group. Kafka assigns partitions to it. `PollFetches` returns batches of records from all assigned partitions. Each record is unmarshalled and submitted to the worker pool, which commits the offset and then runs the handler.
 
 ```mermaid
 sequenceDiagram
     participant Kafka
     participant Consumer
+    participant Pool
     participant Handler
 
     loop Poll loop
-        Consumer->>Kafka: Poll for records
+        Consumer->>Kafka: PollFetches(ctx)
         Kafka-->>Consumer: Batch of records
 
-        loop Each record (sequential)
-            Consumer->>Kafka: Commit offset
+        loop Each record
             Consumer->>Consumer: Unmarshal record
-            Consumer->>Handler: Process job
+            Consumer->>Pool: Submit(job + commitFn)
+            Pool->>Kafka: CommitRecords(context.Background(), record)
+            Pool->>Handler: handler(ctx, job)
         end
     end
 ```
 
+> **Note:** `commitFn` uses `context.Background()`, not the polling context. This ensures commits succeed even when the polling loop is cancelled during shutdown.
+
 ### Scaling
 
-Throughput scales by adding consumer instances (each gets a subset of partitions). Within a single instance, processing is sequential.
+Throughput scales by adding consumer instances (each gets a subset of partitions). Within a single instance, records are submitted to a worker pool for concurrent processing.
 
-1. **Instance 1 starts** — gets both partitions
-2. **Instance 2 starts** — triggers rebalance, each instance gets 1 partition
-3. **Instance 2 dies** — triggers rebalance, instance 1 gets both back
+1. **Instance 1 starts** — gets all partitions
+2. **Instance 2 starts** — triggers rebalance, partitions are distributed
+3. **Instance 2 dies** — triggers rebalance, instance 1 gets all back
 
 Maximum useful consumer instances = number of partitions. Extra instances sit idle as hot standbys.
 
@@ -107,7 +144,7 @@ Maximum useful consumer instances = number of partitions. Extra instances sit id
 
 We commit the offset **before** processing the job. This is a deliberate design choice driven by the fact that our job (generating a JWT and sending it to a webhook) is **not idempotent** — sending two different JWTs for the same request is worse than losing a single job.
 
-With franz-go, `CommitRecords` is synchronous and returns an error. If the commit fails, we skip the record entirely — it will be redelivered on the next poll.
+With franz-go, `CommitRecords` is synchronous and returns an error. If the commit fails, the pool worker skips the record entirely — it will be redelivered on the next poll. The commit uses `context.Background()` so it is not affected by polling-loop cancellation during shutdown.
 
 ### Message processing flow
 
@@ -185,6 +222,7 @@ When the service receives a shutdown signal (SIGINT/SIGTERM):
 sequenceDiagram
     participant Signal
     participant App
+    participant Pool
     participant Consumer
     participant Kafka
 
@@ -192,12 +230,14 @@ sequenceDiagram
     App->>App: Cancel context
     Note over Consumer: PollFetches returns (ctx cancelled)
     Consumer->>Consumer: Start() returns
+    App->>Pool: Close()
+    Note over Pool: Drain in-flight jobs<br/>(commits use context.Background)
     App->>Consumer: Close()
     Consumer->>Kafka: LeaveGroup
     Note over Kafka: Remaining consumers<br/>get rebalanced immediately
 ```
 
-The current record finishes processing before `PollFetches` is called again and the context cancellation is detected.
+The pool is closed before the consumer so that in-flight commits complete while the Kafka connection is still alive.
 
 ---
 
@@ -221,14 +261,7 @@ All metrics are defined in the `otel` package and recorded via function calls (n
 
 ---
 
-## Integration tests
-
-All tests use [testcontainers-go](https://github.com/testcontainers/testcontainers-go) to spin up a real Kafka instance in Docker. No manual setup needed.
-
-Run with:
-```bash
-go test -tags=integration -v -timeout 300s ./kafka/...
-```
+## Test details
 
 ### Test 1: Produce and Consume
 
