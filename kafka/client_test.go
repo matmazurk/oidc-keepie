@@ -544,22 +544,14 @@ func TestOffsetPersistence(t *testing.T) {
 	cancel1()
 	consumer1.Close()
 
-	// produce 2 more messages while no consumer is attached
-	for i := 3; i < 5; i++ {
-		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
-		if err := producer.Send(ctx, j); err != nil {
-			t.Fatalf("sending message %d: %v", i, err)
-		}
-	}
-
-	// start a new consumer in the same group. It must NOT override committed
-	// offsets — use the default reset (AtStart) so we prove offsets are
-	// what's driving the resume, not the reset policy.
+	// Start a new consumer in the same group. It uses the default reset
+	// (AtStart) so we prove committed offsets drive the resume, not the
+	// reset policy. A sync marker confirms consumer 2 is caught up past
+	// the first batch before we produce the second batch — this avoids
+	// flakes from commits that raced with consumer 1's shutdown.
 	received2 := make(chan string, 10)
-	p2 := pool.New(2, filteringHandler(testID, func(ctx context.Context, j job.Job) {
-		if isSyncJobID(j.JobID()) {
-			return
-		}
+	sync2 := make(chan struct{}, partitions)
+	p2 := pool.New(2, syncingHandler(testID, sync2, func(ctx context.Context, j job.Job) {
 		received2 <- stripTag(testID, j.JobID())
 	}))
 	defer p2.Close()
@@ -573,6 +565,17 @@ func TestOffsetPersistence(t *testing.T) {
 	go func() {
 		_ = consumer2.Start(ctx)
 	}()
+
+	waitForSync(t, ctx, producer, testID, sync2)
+
+	// produce 2 more messages — consumer 2 is synced so these will be the
+	// only test messages it sees (job-0,1,2 are past committed offsets).
+	for i := 3; i < 5; i++ {
+		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
+		if err := producer.Send(ctx, j); err != nil {
+			t.Fatalf("sending message %d: %v", i, err)
+		}
+	}
 
 	var newMessages []string
 	count = 0
