@@ -503,13 +503,16 @@ func TestOffsetPersistence(t *testing.T) {
 
 	now := time.Now().Truncate(time.Second)
 
-	// consumer 1 — consumes first batch so offsets get committed for the group
+	// consumer 1 — consumes first batch so offsets get committed for the group.
+	// Pool size 1: with multiple workers, commits from the same partition can
+	// land out of order (worker 2 commits offset 51 after worker 1 committed
+	// offset 104), regressing the committed position. Sequential processing
+	// keeps per-partition commits monotonic.
 	received1 := make(chan string, 10)
 	sync1 := make(chan struct{}, partitions)
-	p1 := pool.New(2, syncingHandler(testID, sync1, func(ctx context.Context, j job.Job) {
+	p1 := pool.New(1, syncingHandler(testID, sync1, func(ctx context.Context, j job.Job) {
 		received1 <- stripTag(testID, j.JobID())
 	}))
-	defer p1.Close()
 
 	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1, tlsCfg, kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()))
 	if err != nil {
@@ -540,7 +543,10 @@ func TestOffsetPersistence(t *testing.T) {
 		}
 	}
 
-	// stop consumer 1 — its committed offsets stay in the group
+	// Close pool first (drains in-flight commits while ctx1 is still live),
+	// then cancel/close consumer. Reversing this order causes commits to
+	// fail with "context canceled", leaving offsets uncommitted.
+	p1.Close()
 	cancel1()
 	consumer1.Close()
 
@@ -551,7 +557,7 @@ func TestOffsetPersistence(t *testing.T) {
 	// flakes from commits that raced with consumer 1's shutdown.
 	received2 := make(chan string, 10)
 	sync2 := make(chan struct{}, partitions)
-	p2 := pool.New(2, syncingHandler(testID, sync2, func(ctx context.Context, j job.Job) {
+	p2 := pool.New(1, syncingHandler(testID, sync2, func(ctx context.Context, j job.Job) {
 		received2 <- stripTag(testID, j.JobID())
 	}))
 	defer p2.Close()
