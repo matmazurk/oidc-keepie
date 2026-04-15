@@ -74,18 +74,20 @@ type Consumer struct {
 	submitter Submitter
 }
 
-func NewConsumer(brokers []string, groupID, topic string, submitter Submitter, tlsCfg *tls.Config) (*Consumer, error) {
+func NewConsumer(brokers []string, groupID, topic string, submitter Submitter, tlsCfg *tls.Config, extraOpts ...kgo.Opt) (*Consumer, error) {
 	if tlsCfg == nil {
 		return nil, fmt.Errorf("tls config is required")
 	}
-	client, err := kgo.NewClient(
+	opts := []kgo.Opt{
 		kgo.SeedBrokers(brokers...),
 		kgo.DialTLSConfig(tlsCfg),
 		kgo.ConsumerGroup(groupID),
 		kgo.ConsumeTopics(topic),
 		kgo.DisableAutoCommit(),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-	)
+	}
+	opts = append(opts, extraOpts...)
+	client, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("creating consumer client: %w", err)
 	}

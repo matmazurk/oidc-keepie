@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/matmazurk/oidc-keepie/job"
 	kfk "github.com/matmazurk/oidc-keepie/kafka"
 	"github.com/matmazurk/oidc-keepie/pool"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 var (
@@ -22,6 +24,7 @@ var (
 	tlsCfg      *tls.Config
 	topic       string
 	groupPrefix string
+	partitions  int
 	runID       string
 )
 
@@ -47,6 +50,15 @@ func TestMain(m *testing.M) {
 
 	groupPrefix = os.Getenv("KAFKA_TEST_GROUP_PREFIX")
 
+	partitions = 3
+	if v := os.Getenv("KAFKA_TEST_PARTITIONS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			panic(fmt.Sprintf("invalid KAFKA_TEST_PARTITIONS=%q", v))
+		}
+		partitions = n
+	}
+
 	var err error
 	tlsCfg, err = kfk.LoadTLSConfig(caFile, certFile, keyFile)
 	if err != nil {
@@ -65,9 +77,19 @@ func requireKafka(t *testing.T) {
 	}
 }
 
+// newTestID returns the per-run tag embedded in every message this test
+// produces. Includes runID so messages from previous runs (still in the
+// topic) are filtered out.
 func newTestID(t *testing.T) string {
 	t.Helper()
-	return groupPrefix + runID + "-" + t.Name()
+	return runID + "-" + t.Name()
+}
+
+// newGroupID returns the consumer group name for the test — stable across
+// runs so Kafka ACLs can be granted per-group under the required prefix.
+func newGroupID(t *testing.T) string {
+	t.Helper()
+	return groupPrefix + t.Name()
 }
 
 func taggedJobID(testID, base string) string {
@@ -79,8 +101,7 @@ func stripTag(testID, jobID string) string {
 }
 
 // filteringHandler wraps a job handler so that jobs not tagged for this
-// test are silently dropped before reaching the real handler. Used so that
-// tests sharing a single topic do not see each other's messages.
+// test's run are silently dropped before reaching the real handler.
 func filteringHandler(testID string, inner func(context.Context, job.Job)) func(context.Context, job.Job) {
 	prefix := testID + ":"
 	return func(ctx context.Context, j job.Job) {
@@ -91,10 +112,74 @@ func filteringHandler(testID string, inner func(context.Context, job.Job)) func(
 	}
 }
 
+const syncMarker = "__sync__"
+
+func isSyncJobID(jobID string) bool {
+	return strings.Contains(jobID, ":"+syncMarker)
+}
+
+// syncingHandler wraps an inner handler so sync-marker jobs produced by
+// waitForSync are absorbed and delivered to syncCh instead of inner.
+// Callers should size syncCh to at least `partitions` to avoid dropping.
+func syncingHandler(testID string, syncCh chan<- struct{}, inner func(context.Context, job.Job)) func(context.Context, job.Job) {
+	return filteringHandler(testID, func(ctx context.Context, j job.Job) {
+		if isSyncJobID(j.JobID()) {
+			select {
+			case syncCh <- struct{}{}:
+			default:
+			}
+			return
+		}
+		inner(ctx, j)
+	})
+}
+
+// waitForSync produces sync markers until each provided sync channel
+// receives at least one signal. Markers are re-sent every 2 seconds to
+// cover the window where consumers are still joining the group or
+// rebalancing — a marker produced before a consumer was assigned its
+// partition gets consumed by whichever consumer held that partition
+// at the time, which may not be the one we're waiting on.
+func waitForSync(t *testing.T, ctx context.Context, producer *kfk.Producer, testID string, syncChs ...<-chan struct{}) {
+	t.Helper()
+
+	sendMarkers := func() {
+		for i := 0; i < partitions; i++ {
+			j := job.MustNew(
+				taggedJobID(testID, fmt.Sprintf("%s%d", syncMarker, i)),
+				"https://example.com/sync",
+				time.Now(),
+			)
+			if err := producer.Send(ctx, j); err != nil {
+				t.Fatalf("sending sync marker %d: %v", i, err)
+			}
+		}
+	}
+
+	deadline := time.After(30 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	sendMarkers()
+	for i, ch := range syncChs {
+	wait:
+		for {
+			select {
+			case <-ch:
+				break wait
+			case <-ticker.C:
+				sendMarkers()
+			case <-deadline:
+				t.Fatalf("consumer %d did not sync within 30s", i)
+			}
+		}
+	}
+}
+
 func TestProduceAndConsume(t *testing.T) {
 	requireKafka(t)
 	testID := newTestID(t)
-	groupID := testID
+	groupID := newGroupID(t)
 
 	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
@@ -108,25 +193,23 @@ func TestProduceAndConsume(t *testing.T) {
 	j := job.MustNew(taggedJobID(testID, "job-1"), "https://example.com/webhook", now)
 
 	received := make(chan job.Job, 1)
-	p := pool.New(2, filteringHandler(testID, func(ctx context.Context, j job.Job) {
+	syncCh := make(chan struct{}, partitions)
+	p := pool.New(2, syncingHandler(testID, syncCh, func(ctx context.Context, j job.Job) {
 		received <- j
 	}))
 	defer p.Close()
 
-	consumer, err := kfk.NewConsumer(brokers, groupID, topic, p, tlsCfg)
+	consumer, err := kfk.NewConsumer(brokers, groupID, topic, p, tlsCfg, kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()))
 	if err != nil {
 		t.Fatalf("creating consumer: %v", err)
 	}
 	defer consumer.Close()
 
 	go func() {
-		if err := consumer.Start(ctx); err != nil {
-			t.Logf("consumer stopped: %v", err)
-		}
+		_ = consumer.Start(ctx)
 	}()
 
-	// wait for consumer to join the group and position at end-of-log
-	time.Sleep(5 * time.Second)
+	waitForSync(t, ctx, producer, testID, syncCh)
 
 	if err := producer.Send(ctx, j); err != nil {
 		t.Fatalf("sending message: %v", err)
@@ -160,7 +243,7 @@ func TestProduceAndConsume(t *testing.T) {
 func TestWorkloadDistribution(t *testing.T) {
 	requireKafka(t)
 	testID := newTestID(t)
-	groupID := testID
+	groupID := newGroupID(t)
 
 	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
@@ -182,7 +265,7 @@ func TestWorkloadDistribution(t *testing.T) {
 	var closedOnce sync.Once
 
 	makeHandler := func(name string) func(context.Context, job.Job) {
-		return filteringHandler(testID, func(ctx context.Context, j job.Job) {
+		return func(ctx context.Context, j job.Job) {
 			mu.Lock()
 			defer mu.Unlock()
 			receivedByConsumer[name] = append(receivedByConsumer[name], stripTag(testID, j.JobID()))
@@ -190,38 +273,35 @@ func TestWorkloadDistribution(t *testing.T) {
 			if total == messageCount {
 				closedOnce.Do(func() { close(allReceived) })
 			}
-		})
+		}
 	}
 
-	p1 := pool.New(2, makeHandler("consumer-1"))
+	sync1 := make(chan struct{}, partitions)
+	p1 := pool.New(2, syncingHandler(testID, sync1, makeHandler("consumer-1")))
 	defer p1.Close()
-	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1, tlsCfg)
+	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1, tlsCfg, kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()))
 	if err != nil {
 		t.Fatalf("creating consumer 1: %v", err)
 	}
 	defer consumer1.Close()
 
-	p2 := pool.New(2, makeHandler("consumer-2"))
+	sync2 := make(chan struct{}, partitions)
+	p2 := pool.New(2, syncingHandler(testID, sync2, makeHandler("consumer-2")))
 	defer p2.Close()
-	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2, tlsCfg)
+	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2, tlsCfg, kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()))
 	if err != nil {
 		t.Fatalf("creating consumer 2: %v", err)
 	}
 	defer consumer2.Close()
 
 	go func() {
-		if err := consumer1.Start(ctx); err != nil {
-			t.Logf("consumer 1 stopped: %v", err)
-		}
+		_ = consumer1.Start(ctx)
 	}()
 	go func() {
-		if err := consumer2.Start(ctx); err != nil {
-			t.Logf("consumer 2 stopped: %v", err)
-		}
+		_ = consumer2.Start(ctx)
 	}()
 
-	// wait for consumers to join the group before producing
-	time.Sleep(5 * time.Second)
+	waitForSync(t, ctx, producer, testID, sync1, sync2)
 
 	for i := range messageCount {
 		j := job.MustNew(
@@ -279,7 +359,7 @@ func TestWorkloadDistribution(t *testing.T) {
 func TestConsumerRebalancing(t *testing.T) {
 	requireKafka(t)
 	testID := newTestID(t)
-	groupID := testID
+	groupID := newGroupID(t)
 
 	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
@@ -298,7 +378,8 @@ func TestConsumerRebalancing(t *testing.T) {
 	consumer1Received := make(chan string, 100)
 	consumer2Received := make(chan string, 100)
 
-	p1 := pool.New(2, filteringHandler(testID, func(ctx context.Context, j job.Job) {
+	sync1 := make(chan struct{}, partitions)
+	p1 := pool.New(2, syncingHandler(testID, sync1, func(ctx context.Context, j job.Job) {
 		id := stripTag(testID, j.JobID())
 		mu.Lock()
 		consumer1Messages = append(consumer1Messages, id)
@@ -307,12 +388,13 @@ func TestConsumerRebalancing(t *testing.T) {
 	}))
 	defer p1.Close()
 
-	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1, tlsCfg)
+	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1, tlsCfg, kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()))
 	if err != nil {
 		t.Fatalf("creating consumer 1: %v", err)
 	}
 
-	p2 := pool.New(2, filteringHandler(testID, func(ctx context.Context, j job.Job) {
+	sync2 := make(chan struct{}, partitions*2)
+	p2 := pool.New(2, syncingHandler(testID, sync2, func(ctx context.Context, j job.Job) {
 		id := stripTag(testID, j.JobID())
 		mu.Lock()
 		consumer2Messages = append(consumer2Messages, id)
@@ -321,7 +403,7 @@ func TestConsumerRebalancing(t *testing.T) {
 	}))
 	defer p2.Close()
 
-	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2, tlsCfg)
+	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2, tlsCfg, kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()))
 	if err != nil {
 		t.Fatalf("creating consumer 2: %v", err)
 	}
@@ -331,20 +413,15 @@ func TestConsumerRebalancing(t *testing.T) {
 	ctx1, cancel1 := context.WithCancel(ctx)
 
 	go func() {
-		if err := consumer1.Start(ctx1); err != nil {
-			t.Logf("consumer 1 stopped: %v", err)
-		}
+		_ = consumer1.Start(ctx1)
 	}()
 	go func() {
-		if err := consumer2.Start(ctx); err != nil {
-			t.Logf("consumer 2 stopped: %v", err)
-		}
+		_ = consumer2.Start(ctx)
 	}()
 
-	// wait for both consumers to join
-	time.Sleep(5 * time.Second)
+	// phase 1: both consumers active
+	waitForSync(t, ctx, producer, testID, sync1, sync2)
 
-	// send messages while both consumers are active
 	for i := range 5 {
 		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-phase1-%d", i)), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, j); err != nil {
@@ -352,7 +429,6 @@ func TestConsumerRebalancing(t *testing.T) {
 		}
 	}
 
-	// wait for phase 1 messages to be consumed
 	phase1Count := 0
 	for phase1Count < 5 {
 		select {
@@ -365,14 +441,13 @@ func TestConsumerRebalancing(t *testing.T) {
 		}
 	}
 
-	// stop consumer 1
+	// stop consumer 1 and wait for consumer 2 to take over
 	cancel1()
 	consumer1.Close()
 
-	// wait for rebalance
-	time.Sleep(5 * time.Second)
+	// phase 2: only consumer 2 — re-sync to confirm rebalance completed
+	waitForSync(t, ctx, producer, testID, sync2)
 
-	// send more messages — consumer 2 should get all of them
 	for i := range 5 {
 		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-phase2-%d", i)), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, j); err != nil {
@@ -404,7 +479,7 @@ func TestConsumerRebalancing(t *testing.T) {
 func TestOffsetPersistence(t *testing.T) {
 	requireKafka(t)
 	testID := newTestID(t)
-	groupID := testID
+	groupID := newGroupID(t)
 
 	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
@@ -416,29 +491,26 @@ func TestOffsetPersistence(t *testing.T) {
 
 	now := time.Now().Truncate(time.Second)
 
-	// start consumer 1 first so the brand-new group is positioned at end-of-log
+	// consumer 1 — consumes first batch so offsets get committed for the group
 	received1 := make(chan string, 10)
-	p1 := pool.New(2, filteringHandler(testID, func(ctx context.Context, j job.Job) {
+	sync1 := make(chan struct{}, partitions)
+	p1 := pool.New(2, syncingHandler(testID, sync1, func(ctx context.Context, j job.Job) {
 		received1 <- stripTag(testID, j.JobID())
 	}))
 	defer p1.Close()
 
-	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1, tlsCfg)
+	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1, tlsCfg, kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()))
 	if err != nil {
 		t.Fatalf("creating consumer 1: %v", err)
 	}
 
 	ctx1, cancel1 := context.WithCancel(ctx)
 	go func() {
-		if err := consumer1.Start(ctx1); err != nil {
-			t.Logf("consumer 1 stopped: %v", err)
-		}
+		_ = consumer1.Start(ctx1)
 	}()
 
-	// wait for consumer to join and position at end-of-log
-	time.Sleep(5 * time.Second)
+	waitForSync(t, ctx, producer, testID, sync1)
 
-	// send 3 messages
 	for i := range 3 {
 		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, j); err != nil {
@@ -456,11 +528,11 @@ func TestOffsetPersistence(t *testing.T) {
 		}
 	}
 
-	// stop first consumer
+	// stop consumer 1 — its committed offsets stay in the group
 	cancel1()
 	consumer1.Close()
 
-	// send 2 more messages
+	// produce 2 more messages while no consumer is attached
 	for i := 3; i < 5; i++ {
 		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, j); err != nil {
@@ -468,9 +540,14 @@ func TestOffsetPersistence(t *testing.T) {
 		}
 	}
 
-	// start a new consumer in the same group — should only get the 2 new messages
+	// start a new consumer in the same group. It must NOT override committed
+	// offsets — use the default reset (AtStart) so we prove offsets are
+	// what's driving the resume, not the reset policy.
 	received2 := make(chan string, 10)
 	p2 := pool.New(2, filteringHandler(testID, func(ctx context.Context, j job.Job) {
+		if isSyncJobID(j.JobID()) {
+			return
+		}
 		received2 <- stripTag(testID, j.JobID())
 	}))
 	defer p2.Close()
@@ -482,9 +559,7 @@ func TestOffsetPersistence(t *testing.T) {
 	defer consumer2.Close()
 
 	go func() {
-		if err := consumer2.Start(ctx); err != nil {
-			t.Logf("consumer 2 stopped: %v", err)
-		}
+		_ = consumer2.Start(ctx)
 	}()
 
 	var newMessages []string
@@ -516,7 +591,7 @@ func TestOffsetPersistence(t *testing.T) {
 func TestRetryableError(t *testing.T) {
 	requireKafka(t)
 	testID := newTestID(t)
-	groupID := testID
+	groupID := newGroupID(t)
 
 	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
 	if err != nil {
@@ -533,7 +608,8 @@ func TestRetryableError(t *testing.T) {
 	done := make(chan struct{})
 	var doneOnce sync.Once
 
-	p := pool.New(2, filteringHandler(testID, func(ctx context.Context, j job.Job) {
+	syncCh := make(chan struct{}, partitions)
+	p := pool.New(2, syncingHandler(testID, syncCh, func(ctx context.Context, j job.Job) {
 		mu.Lock()
 		attempts[j.JobID()]++
 		attempt := attempts[j.JobID()]
@@ -554,20 +630,17 @@ func TestRetryableError(t *testing.T) {
 	}))
 	defer p.Close()
 
-	consumer, err := kfk.NewConsumer(brokers, groupID, topic, p, tlsCfg)
+	consumer, err := kfk.NewConsumer(brokers, groupID, topic, p, tlsCfg, kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()))
 	if err != nil {
 		t.Fatalf("creating consumer: %v", err)
 	}
 	defer consumer.Close()
 
 	go func() {
-		if err := consumer.Start(ctx); err != nil {
-			t.Logf("consumer stopped: %v", err)
-		}
+		_ = consumer.Start(ctx)
 	}()
 
-	// wait for consumer to join and position at end-of-log
-	time.Sleep(5 * time.Second)
+	waitForSync(t, ctx, producer, testID, syncCh)
 
 	tagged := taggedJobID(testID, "job-1")
 	j := job.MustNew(tagged, "https://example.com/webhook", now)
