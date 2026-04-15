@@ -490,7 +490,11 @@ func TestConsumerRebalancing(t *testing.T) {
 func TestOffsetPersistence(t *testing.T) {
 	requireKafka(t)
 	t.Parallel()
-	testID := newTestID(t)
+	// Two distinct testIDs for each phase. Same group — consumer 2 resumes
+	// from consumer 1's committed offsets. Separate tags so any phase-1
+	// messages replayed during consumer 2's catch-up are filtered out.
+	testID1 := newTestID(t)
+	testID2 := newTestID(t)
 	groupID := newGroupID(t)
 
 	producer, err := kfk.NewProducer(brokers, topic, tlsCfg)
@@ -503,15 +507,11 @@ func TestOffsetPersistence(t *testing.T) {
 
 	now := time.Now().Truncate(time.Second)
 
-	// consumer 1 — consumes first batch so offsets get committed for the group.
-	// Pool size 1: with multiple workers, commits from the same partition can
-	// land out of order (worker 2 commits offset 51 after worker 1 committed
-	// offset 104), regressing the committed position. Sequential processing
-	// keeps per-partition commits monotonic.
+	// --- phase 1: consumer 1 processes job-0..2, commits offsets ---
 	received1 := make(chan string, 10)
 	sync1 := make(chan struct{}, partitions)
-	p1 := pool.New(1, syncingHandler(testID, sync1, func(ctx context.Context, j job.Job) {
-		received1 <- stripTag(testID, j.JobID())
+	p1 := pool.New(1, syncingHandler(testID1, sync1, func(ctx context.Context, j job.Job) {
+		received1 <- stripTag(testID1, j.JobID())
 	}))
 
 	consumer1, err := kfk.NewConsumer(brokers, groupID, topic, p1, tlsCfg, kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()))
@@ -524,10 +524,10 @@ func TestOffsetPersistence(t *testing.T) {
 		_ = consumer1.Start(ctx1)
 	}()
 
-	waitForSync(t, ctx, producer, testID, sync1)
+	waitForSync(t, ctx, producer, testID1, sync1)
 
 	for i := range 3 {
-		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
+		j := job.MustNew(taggedJobID(testID1, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, j); err != nil {
 			t.Fatalf("sending message %d: %v", i, err)
 		}
@@ -543,25 +543,19 @@ func TestOffsetPersistence(t *testing.T) {
 		}
 	}
 
-	// Close pool first (drains in-flight commits while ctx1 is still live),
-	// then cancel/close consumer. Reversing this order causes commits to
-	// fail with "context canceled", leaving offsets uncommitted.
 	p1.Close()
 	cancel1()
 	consumer1.Close()
 
-	// Start a new consumer in the same group. It uses the default reset
-	// (AtStart) so we prove committed offsets drive the resume, not the
-	// reset policy. A sync marker confirms consumer 2 is caught up past
-	// the first batch before we produce the second batch — this avoids
-	// flakes from commits that raced with consumer 1's shutdown.
+	// --- phase 2: consumer 2 joins same group, proves offset resume ---
 	received2 := make(chan string, 10)
 	sync2 := make(chan struct{}, partitions)
-	p2 := pool.New(1, syncingHandler(testID, sync2, func(ctx context.Context, j job.Job) {
-		received2 <- stripTag(testID, j.JobID())
+	p2 := pool.New(2, syncingHandler(testID2, sync2, func(ctx context.Context, j job.Job) {
+		received2 <- stripTag(testID2, j.JobID())
 	}))
 	defer p2.Close()
 
+	// Default reset is AtStart — committed offsets drive resume, not policy.
 	consumer2, err := kfk.NewConsumer(brokers, groupID, topic, p2, tlsCfg)
 	if err != nil {
 		t.Fatalf("creating consumer 2: %v", err)
@@ -572,34 +566,10 @@ func TestOffsetPersistence(t *testing.T) {
 		_ = consumer2.Start(ctx)
 	}()
 
-	// Wait for sync markers on ALL partitions — a single marker only proves
-	// one partition is caught up; consumer 2 might still be behind on others
-	// (AtStart fallback if committed offset was lost during consumer 1 teardown).
-	sendMarkers := func() {
-		for i := range partitions {
-			j := job.MustNew(taggedJobID(testID, fmt.Sprintf("%s%d", syncMarker, i)), "https://example.com/sync", time.Now())
-			producer.Send(ctx, j)
-		}
-	}
-	deadline := time.After(30 * time.Second)
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	sendMarkers()
-	for synced := 0; synced < partitions; {
-		select {
-		case <-sync2:
-			synced++
-		case <-ticker.C:
-			sendMarkers()
-		case <-deadline:
-			t.Fatalf("synced %d/%d partitions before timeout", synced, partitions)
-		}
-	}
+	waitForSync(t, ctx, producer, testID2, sync2)
 
-	// produce 2 more messages — consumer 2 is synced on every partition so
-	// these will be the only test messages it sees.
 	for i := 3; i < 5; i++ {
-		j := job.MustNew(taggedJobID(testID, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
+		j := job.MustNew(taggedJobID(testID2, fmt.Sprintf("job-%d", i)), "https://example.com/webhook", now)
 		if err := producer.Send(ctx, j); err != nil {
 			t.Fatalf("sending message %d: %v", i, err)
 		}
@@ -617,12 +587,10 @@ func TestOffsetPersistence(t *testing.T) {
 		}
 	}
 
-	// give a moment to check no extra messages arrive
 	select {
 	case id := <-received2:
 		t.Errorf("unexpected extra message received: %s", id)
 	case <-time.After(3 * time.Second):
-		// good — no more messages
 	}
 
 	if len(newMessages) != 2 {
