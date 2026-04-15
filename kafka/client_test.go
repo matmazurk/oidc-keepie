@@ -6,6 +6,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -67,6 +69,8 @@ func TestMain(m *testing.M) {
 	}
 
 	runID = fmt.Sprintf("run-%d", time.Now().UnixNano())
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	os.Exit(m.Run())
 }
