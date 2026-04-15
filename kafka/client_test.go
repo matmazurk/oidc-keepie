@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -77,12 +78,15 @@ func requireKafka(t *testing.T) {
 	}
 }
 
-// newTestID returns the per-run tag embedded in every message this test
-// produces. Includes runID so messages from previous runs (still in the
-// topic) are filtered out.
+var invocationSeq atomic.Int64
+
+// newTestID returns the per-invocation tag embedded in every message this
+// test produces. Includes runID plus a sequence counter so that repeated
+// invocations within the same binary (e.g. -count=10) get distinct tags.
 func newTestID(t *testing.T) string {
 	t.Helper()
-	return runID + "-" + t.Name()
+	n := invocationSeq.Add(1)
+	return fmt.Sprintf("%s-%d-%s", runID, n, t.Name())
 }
 
 // newGroupID returns the consumer group name for the test — stable across
