@@ -58,7 +58,11 @@ func main() {
 			IdleConnTimeout:     90 * time.Second,
 		},
 	}
-	rawHandler := handler.New(&stubIssuer{}, httpClient)
+	rawHandler := handler.New(&handler.StubSigner{}, handler.Config{
+		Issuer:   "https://keepie.example.com",
+		Audience: "https://api.example.com",
+		TTL:      5 * time.Minute,
+	}, httpClient)
 
 	wrappedHandler := func(ctx context.Context, j job.Job) {
 		start := time.Now()
@@ -139,10 +143,4 @@ func main() {
 	consumer.Close()
 	workerPool.Close()
 	producer.Close()
-}
-
-type stubIssuer struct{}
-
-func (s *stubIssuer) Issue(_ context.Context) ([]byte, error) {
-	return []byte("placeholder-token"), nil
 }
